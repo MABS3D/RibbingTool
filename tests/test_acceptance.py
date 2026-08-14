@@ -51,7 +51,9 @@ def test_cruscotto_ui_flow_fast_engine(part1_path, tmp_path):
     assert r.status_code == 200, r.text
     d1 = r.json()
     assert d1["engine"] == "fast"
-    assert d1["overlay_count"] > 100
+    # crossing isogrid segments weld into a handful of merged clusters —
+    # hundreds of overlays would mean per-segment shatter (the old bug)
+    assert 1 <= d1["overlay_count"] <= 100
 
     stl = c.get("/api/export/stl")
     assert stl.status_code == 200

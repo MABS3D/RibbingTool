@@ -70,3 +70,11 @@ def part1_path():
 @pytest.fixture(scope="session")
 def part2_path():
     return REPO / "testdata" / "part2.stp"
+
+
+@pytest.fixture(scope="session")
+def cruscotto_full_path():
+    p = REPO / "testdata" / "cruscotto_full.stp"
+    if not p.exists():
+        pytest.skip("cruscotto_full.stp not present")
+    return p

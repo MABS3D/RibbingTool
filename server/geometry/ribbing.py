@@ -40,7 +40,7 @@ class RibReport:
     warnings: list = field(default_factory=list)
 
 
-MAX_SEGMENTS = 4000
+MAX_SEGMENTS = 9000
 _FOLD_COS = math.cos(math.radians(85))
 
 
@@ -477,7 +477,29 @@ def _map_points(mapper, pts2d, offsets, max_snap=0.5):
     offsets = np.broadcast_to(np.asarray(offsets, float), (len(pts2d),))
     tri_idx, bary = mapper._locate(pts2d)
     if max_snap is not None and mapper.last_snap.max() > max_snap:
-        return None
+        # capsule caps and offset rings legitimately poke past the flat
+        # domain edge — clamping them onto it is correct run-out geometry.
+        # The domain polygon is buffer(0)-repaired and can seal invalid
+        # hole rings into phantom material, so "inside the polygon" is not
+        # proof of a mapping hole: only points sitting on a FLIPPED flat
+        # triangle (dropped from the location tree — the fold zones that
+        # stretch ribs into giant fans) stay fatal.
+        domain = getattr(mapper, "domain", None)
+        if domain is None:
+            return None
+        import shapely as _shp
+        far = _shp.points(pts2d[mapper.last_snap > max_snap])
+        bad = _shp.contains(domain, far) & (
+            _shp.distance(far, domain.boundary) >= 0.05)
+        if bad.any():
+            flip = np.setdiff1d(np.arange(len(mapper.triangles)),
+                                mapper.valid_idx)
+            folded = np.zeros(len(far), bool)
+            for i in flip:
+                folded |= _shp.intersects(
+                    Polygon(mapper.flat[mapper.triangles[i]]), far)
+            if (bad & folded).any():
+                return None
     uvq = np.einsum("kj,kjd->kd", bary, mapper.region.wedge_uvs[tri_idx])
     out = np.empty((len(uvq), 3))
     for i in range(len(uvq)):
@@ -627,39 +649,37 @@ def _cluster_mesh_filleted(mapper, params, top_offsets, rings2d, ranges,
     H = np.asarray(np.broadcast_to(
         np.asarray(top_offsets(verts2d, params.height), float),
         (len(verts2d),)))
+    # taper run-outs: radii must fade with the local rib height, or the
+    # arcs rise above the ramp (club-shaped tips)
+    rr = np.minimum(r_root, np.clip(H, 0.0, None) * 0.85)
+    rt = np.minimum(r_top, np.clip(H, 0.0, None) * 0.5)
+    rr_r = [rr[o:o + n] for o, n in ranges]
+    rt_r = [rt[o:o + n] for o, n in ranges]
 
     # 2D rings and heights per stack level (bottom cap upward)
     levels = []                            # (ring2d list, h array list)
-    skirt = [r + w * r_root for r, w in zip(rings2d, normals)]
+    skirt = [r + w * s[:, None] for r, w, s in zip(rings2d, normals, rr_r)]
     levels.append((skirt, [np.full(len(r), -params.embed) for r in skirt]))
     if r_root > 0:
         for j in range(KR + 1):
             th = (math.pi / 2) * j / KR
-            l2d = [r + w * r_root * (1 - math.sin(th))
-                   for r, w in zip(rings2d, normals)]
-            levels.append((l2d, [np.full(len(r), r_root * (1 - math.cos(th)))
-                                 for r in l2d]))
-    inset = ([r - w * r_top for r, w in zip(rings2d, normals)]
+            l2d = [r + w * s[:, None] * (1 - math.sin(th))
+                   for r, w, s in zip(rings2d, normals, rr_r)]
+            levels.append((l2d, [s * (1 - math.cos(th)) for s in rr_r]))
+    inset = ([r - w * s[:, None] for r, w, s in zip(rings2d, normals, rt_r)]
              if r_top > 0 else rings2d)
     if r_top > 0:
         for j in range(KT + 1):
             th = (math.pi / 2) * j / KT
-            l2d = [r - w * r_top * (1 - math.cos(th))
-                   for r, w in zip(rings2d, normals)]
+            l2d = [r - w * s[:, None] * (1 - math.cos(th))
+                   for r, w, s in zip(rings2d, normals, rt_r)]
             hs = []
-            off = 0
-            for r in l2d:
-                n = len(r)
-                hv = H[off:off + n] - r_top * (1 - math.sin(th))
-                hs.append(np.clip(hv, r_root, None))
-                off += n
+            for (o, n), s in zip(ranges, rt_r):
+                hv = H[o:o + n] - s * (1 - math.sin(th))
+                hs.append(np.clip(hv, rr[o:o + n], None))
             levels.append((l2d, hs))
     else:
-        hs, off = [], 0
-        for r in rings2d:
-            hs.append(H[off:off + len(r)])
-            off += len(r)
-        levels.append((rings2d, hs))
+        levels.append((rings2d, [H[o:o + n] for o, n in ranges]))
 
     bot_tris = valid_triangulation(skirt)
     top_tris = valid_triangulation(inset) if r_top > 0 else tris
@@ -698,7 +718,7 @@ def _cluster_mesh_filleted(mapper, params, top_offsets, rings2d, ranges,
     return v, np.asarray(faces, np.int64)
 
 
-def _root_bead(mapper, poly, r_root, params, step, quality):
+def _root_bead(mapper, poly, r_root, params, top_offsets, step, quality):
     """Additive quarter-round bead swept along a cluster's base contour.
 
     Fillet geometry as its own watertight tube: it unions into the corner
@@ -739,8 +759,12 @@ def _root_bead(mapper, poly, r_root, params, step, quality):
         if (d3 > 3.0 * np.clip(d2, 1e-9, None) + 1.0).any():
             continue
         w = _ring_normals(ring2d)
-        pts2d = np.vstack([ring2d + w * off for off, _ in prof])
-        hs = np.concatenate([np.full(n, h) for _, h in prof])
+        # the bead must fade with the tapered rib height along the contour
+        H_st = np.broadcast_to(np.asarray(
+            top_offsets(ring2d, params.height), float), (n,))
+        s = np.clip(H_st / r_root, 0.05, 1.0)
+        pts2d = np.vstack([ring2d + w * (off * s[:, None]) for off, _ in prof])
+        hs = np.concatenate([h * s for _, h in prof])
         pts3d = _map_points(mapper, pts2d, hs, max_snap=r_root + 0.6)
         if pts3d is None:
             continue
@@ -804,6 +828,7 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
             rep.segments = len(subsegs)
 
             mapper = _RegionMapper(region, flat, shape, triangles=map_tris)
+            mapper.domain = boundary   # lets _map_points clamp boundary pokes
             step = float(np.clip(params.spacing / 6.0, 0.7, 1.5))
             w_bot = params.thickness / 2.0
             import shapely as _shp
@@ -877,7 +902,7 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                         try:
                             clusters.extend(_root_bead(
                                 mapper, poly, params.fillet_root, params,
-                                step, quality))
+                                top_offsets, step, quality))
                         except Exception:
                             pass
                 if mesh is not None:
