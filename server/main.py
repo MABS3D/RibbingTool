@@ -65,9 +65,40 @@ def _entry():
 
 
 def _overlay_mesh(overlay, lin_defl=0.35):
-    """Merge overlay rib solids into one display mesh (positions, indices)."""
-    vs, ts, off = [], [], 0
+    """Rib overlay as one display mesh — unioned, so junctions read welded.
+
+    Un-unioned solids interpenetrate visibly where ribs cross; the union is
+    also what exports produce, so the viewer shows the true result.
+    """
+    if not overlay:
+        return None
+    import manifold3d as m3d
+    from .geometry.booleans import BooleanError, _to_manifold
+    mans, leftovers = [], []
     for s in overlay:
+        try:
+            mans.append(_to_manifold(s, lin_defl))
+        except BooleanError:
+            leftovers.append(s)
+    vs, ts, off = [], [], 0
+    if mans:
+        try:
+            man = m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
+            try:
+                man = man.simplify(0.03)
+            except Exception:
+                pass
+            mesh = man.to_mesh()
+            v = np.asarray(mesh.vert_properties, np.float64)[:, :3]
+            t = np.asarray(mesh.tri_verts, np.int64)
+            if len(v):
+                vs.append(v)
+                ts.append(t)
+                off = len(v)
+        except Exception:
+            leftovers = list(overlay)
+            vs, ts, off = [], [], 0
+    for s in leftovers:
         v, t = _shape_to_mesh(s, lin_defl)
         if len(v) == 0:
             continue
