@@ -1,5 +1,5 @@
 import { initViewer, loadModel, onPick, getSelection, clearSelection,
-         setSelection, listFaces, lookAtFace } from './viewer.js';
+         setSelection, listFaces, lookAtFace, snapshot } from './viewer.js';
 
 const $ = (id) => document.getElementById(id);
 const banner = $('banner');
@@ -161,6 +161,7 @@ window.__getSelection = () => getSelection();
 window.__setSelection = (ids) => setSelection(ids);
 window.__faces = () => listFaces();
 window.__lookAt = (id) => lookAtFace(id);
+window.__snap = (w) => snapshot(w);
 
 $('btn-clear').addEventListener('click', () => clearSelection());
 $('btn-step').addEventListener('click', () => { window.location = '/api/export/step'; });

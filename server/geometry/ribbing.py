@@ -18,7 +18,7 @@ from OCP.gp import gp_Pnt
 
 from .booleans import BooleanError, _fuse_args, mesh_fallback_fuse
 from .flatten import FlattenError, boundary_loops, flatten
-from .meshing import face_mesh
+from .meshing import region_meshes
 from .patterns import capsule, clip_and_border, generate_segments
 from .step_io import get_face, shape_volume
 
@@ -30,6 +30,7 @@ class RibbingError(Exception):
 @dataclass
 class RibReport:
     face_id: int
+    face_ids: list = field(default_factory=list)
     segments: int = 0
     lofted: int = 0
     skipped: int = 0
@@ -45,62 +46,67 @@ def _signed_area(coords):
     return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
 
 
-def _flat_boundary(mesh, flat):
-    """Shapely polygon (outer + holes) of the flattened face."""
-    loops = boundary_loops(mesh.triangles)
+def _flat_boundary(triangles, flat):
+    """Shapely polygon (outer + holes) of a flattened region."""
+    loops = boundary_loops(triangles)
     rings = [flat[np.asarray(l)] for l in loops if len(l) >= 3]
     if not rings:
-        raise FlattenError("face boundary could not be traced")
+        raise FlattenError("region boundary could not be traced")
     areas = [abs(_signed_area(r)) for r in rings]
-    outer = rings[int(np.argmax(areas))]
-    holes = [r for i, r in enumerate(rings) if i != int(np.argmax(areas))]
-    poly = Polygon(outer, holes)
+    imax = int(np.argmax(areas))
+    poly = Polygon(rings[imax], [r for i, r in enumerate(rings) if i != imax])
     if not poly.is_valid:
         poly = poly.buffer(0)
     if poly.is_empty:
-        raise FlattenError("flattened face boundary is degenerate")
+        raise FlattenError("flattened region boundary is degenerate")
     return poly
 
 
-class _SurfaceMapper:
-    """Maps flattened 2D points back onto the true surface with normal offsets."""
+class _RegionMapper:
+    """Maps flattened 2D points back onto the true (multi-face) surface."""
 
-    def __init__(self, mesh, flat, face, body):
-        self.mesh = mesh
+    def __init__(self, region, flat, body):
+        self.region = region
         self.flat = flat
-        self.tri_polys = [Polygon(flat[t]) for t in mesh.triangles]
+        self.tri_polys = [Polygon(flat[t]) for t in region.triangles]
         self.tree = STRtree(self.tri_polys)
-        self.adaptor = BRepAdaptor_Surface(face)
-        self.props = BRepLProp_SLProps(self.adaptor, 1, 1e-6)
-        self.sign = -1.0 if face.Orientation() == TopAbs_REVERSED else 1.0
+        self.props = {}
+        self.sign = {}
+        self.curv = {}
+        for fid in region.face_ids:
+            face = get_face(body, fid)
+            ad = BRepAdaptor_Surface(face)
+            self.props[fid] = BRepLProp_SLProps(ad, 1, 1e-6)
+            self.curv[fid] = BRepLProp_SLProps(ad, 2, 1e-6)
+            self.sign[fid] = -1.0 if face.Orientation() == TopAbs_REVERSED else 1.0
+        self.flip = 1.0
         self._calibrate(body)
 
-    def _eval(self, u, v):
-        """Surface point and material-outward unit normal at (u, v)."""
-        self.props.SetParameters(float(u), float(v))
-        if not self.props.IsNormalDefined():
+    def _eval(self, fid, u, v):
+        props = self.props[fid]
+        props.SetParameters(float(u), float(v))
+        if not props.IsNormalDefined():
             return None, None
-        p = self.props.Value()
-        n = self.props.Normal()
-        nv = np.array([n.X(), n.Y(), n.Z()]) * self.sign
+        p = props.Value()
+        n = props.Normal()
+        nv = (np.array([n.X(), n.Y(), n.Z()])
+              * self.sign[fid] * self.flip)
         return np.array([p.X(), p.Y(), p.Z()]), nv
 
     def _calibrate(self, body):
-        """Probe just below the surface: must be inside the solid."""
         areas = np.array([p.area for p in self.tri_polys])
-        tri = self.mesh.triangles[int(np.argmax(areas))]
-        uv = self.mesh.uvs[tri].mean(axis=0)
-        p, n = self._eval(uv[0], uv[1])
+        k = int(np.argmax(areas))
+        fid = int(self.region.tri_face[k])
+        uv = self.region.wedge_uvs[k].mean(axis=0)
+        p, n = self._eval(fid, uv[0], uv[1])
         if p is None:
             return
-        probe = p - n * 0.2
         cls = BRepClass3d_SolidClassifier(body)
-        cls.Perform(gp_Pnt(*probe), 1e-6)
+        cls.Perform(gp_Pnt(*(p - n * 0.2)), 1e-6)
         if cls.State() != TopAbs_IN:
-            self.sign = -self.sign
+            self.flip = -1.0
 
     def _locate(self, pts):
-        """Barycentric UV interpolation for an (k,2) array of flat points."""
         k = len(pts)
         geoms = shapely.points(pts)
         tri_idx = np.full(k, -1, dtype=np.int64)
@@ -115,7 +121,7 @@ class _SurfaceMapper:
                 m = missing[p]
                 if tri_idx[m] < 0:
                     tri_idx[m] = t
-        tris = self.mesh.triangles[tri_idx]
+        tris = self.region.triangles[tri_idx]
         a, b, c = (self.flat[tris[:, i]] for i in range(3))
         v0, v1, v2 = b - a, c - a, pts - a
         d00 = np.einsum("ij,ij->i", v0, v0)
@@ -127,19 +133,20 @@ class _SurfaceMapper:
         den[np.abs(den) < 1e-18] = 1e-18
         bv = (d11 * d20 - d01 * d21) / den
         bw = (d00 * d21 - d01 * d20) / den
-        bu = 1.0 - bv - bw
-        bary = np.clip(np.stack([bu, bv, bw], axis=1), 0.0, None)
+        bary = np.clip(np.stack([1.0 - bv - bw, bv, bw], axis=1), 0.0, None)
         bary /= bary.sum(axis=1, keepdims=True)
-        uvs = self.mesh.uvs[tris]                      # (k,3,2)
-        return np.einsum("kj,kjd->kd", bary, uvs)      # (k,2)
+        return tri_idx, bary
 
     def map_loop(self, pts2d, offset):
         """Map a closed 2D loop to 3D at signed normal offset. None on failure."""
-        uvq = self._locate(np.asarray(pts2d, float))
+        pts2d = np.asarray(pts2d, float)
+        tri_idx, bary = self._locate(pts2d)
+        uvq = np.einsum("kj,kjd->kd", bary, self.region.wedge_uvs[tri_idx])
         out = np.empty((len(uvq), 3))
         normals = np.empty((len(uvq), 3))
-        for i, (u, v) in enumerate(uvq):
-            p, n = self._eval(u, v)
+        for i in range(len(uvq)):
+            fid = int(self.region.tri_face[tri_idx[i]])
+            p, n = self._eval(fid, uvq[i, 0], uvq[i, 1])
             if p is None:
                 return None
             out[i] = p + n * offset
@@ -149,17 +156,18 @@ class _SurfaceMapper:
         if ln < 1e-9:
             return None
         if (normals @ (mean / ln)).min() < _FOLD_COS:
-            return None  # surface folds >85 deg within one rib — unsafe
+            return None  # crosses a sharp edge / folds >85 deg — unsafe rib
         return out
 
     def min_curvature_radius(self, pts2d):
-        """Smallest |1/max curvature| over sample points; inf if undefined."""
-        uvq = self._locate(np.asarray(pts2d, float))
-        props = BRepLProp_SLProps(self.adaptor, 2, 1e-6)
+        tri_idx, bary = self._locate(np.asarray(pts2d, float))
+        uvq = np.einsum("kj,kjd->kd", bary, self.region.wedge_uvs[tri_idx])
         rmin = math.inf
-        for u, v in uvq:
+        for i in range(len(uvq)):
+            fid = int(self.region.tri_face[tri_idx[i]])
             try:
-                props.SetParameters(float(u), float(v))
+                props = self.curv[fid]
+                props.SetParameters(float(uvq[i, 0]), float(uvq[i, 1]))
                 if not props.IsCurvatureDefined():
                     continue
                 c = max(abs(props.MaxCurvature()), abs(props.MinCurvature()))
@@ -213,7 +221,7 @@ def _sew_rib(bottom, top):
     def tri(a, b, c):
         if (np.linalg.norm(np.cross(np.asarray(b) - a, np.asarray(c) - a))
                 < 1e-10):
-            return  # degenerate sliver
+            return
         poly = BRepBuilderAPI_MakePolygon(
             gp_Pnt(*map(float, a)), gp_Pnt(*map(float, b)),
             gp_Pnt(*map(float, c)), True)
@@ -239,15 +247,9 @@ def _sew_rib(bottom, top):
     return solid
 
 
-def _face_ribs(shape, fid, params, lin_defl, rep):
-    face = get_face(shape, fid)
-    BRepMesh_IncrementalMesh(face, lin_defl, False, 0.3, True)
-    mesh = face_mesh(face, fid)
-    if mesh is None:
-        rep.warnings.append("face could not be triangulated")
-        return []
-    flat = flatten(mesh)
-    boundary = _flat_boundary(mesh, flat)
+def _region_ribs(shape, region, params, rep, stagger):
+    flat = flatten(region)
+    boundary = _flat_boundary(region.triangles, flat)
     lines = clip_and_border(generate_segments(params, boundary.bounds),
                             boundary, params)
     subsegs = []
@@ -256,35 +258,33 @@ def _face_ribs(shape, fid, params, lin_defl, rep):
         subsegs += [(cs[i], cs[i + 1]) for i in range(len(cs) - 1)]
     if not subsegs:
         rep.warnings.append(
-            "pattern produced no ribs on this face (margin too large or spacing "
-            "larger than the face)")
+            "pattern produced no ribs on this region (margin too large or "
+            "spacing larger than the region)")
         return []
     if len(subsegs) > MAX_SEGMENTS:
         raise RibbingError(
-            f"pattern produces {len(subsegs)} rib segments (max {MAX_SEGMENTS}) — "
-            "increase spacing or lower density")
+            f"pattern produces {len(subsegs)} rib segments (max {MAX_SEGMENTS})"
+            " — increase spacing or lower density")
     rep.segments = len(subsegs)
 
-    mapper = _SurfaceMapper(mesh, flat, face, shape)
+    mapper = _RegionMapper(region, flat, shape)
     w_bot = params.thickness / 2.0
     w_top = max(w_bot - params.height * math.tan(math.radians(params.draft_deg)),
                 w_bot * 0.05, 1e-3)
-    build = _loft if mesh.is_planar else _sew_rib
+    step = float(np.clip(params.spacing / 5.0, 0.8, 2.0))
+    build = _loft if region.all_planar else _sew_rib
     solids = []
     for i, (p0, p1) in enumerate(subsegs):
-        # On curved faces, stagger each rib's offsets by a hair (< 0.13 mm) so
-        # no two ribs share an offset surface: tangent cap-cap contacts at
-        # pattern junctions otherwise corrupt the boolean fuse.
-        if mesh.is_planar:
-            d_embed, d_height = params.embed, params.height
-        else:
+        # Staggered offsets keep tangent cap contacts out of the exact OCCT
+        # fuse; the mesh-space union does not need them.
+        if stagger and not region.all_planar:
             d_embed = params.embed + (i * 7 % 64) * 0.002
             d_height = params.height + (i * 11 % 64) * 0.002
+        else:
+            d_embed, d_height = params.embed, params.height
         try:
-            bot2 = capsule(p0, p1, w_bot)
-            top2 = capsule(p0, p1, w_top)
-            bot3 = mapper.map_loop(bot2, -d_embed)
-            top3 = mapper.map_loop(top2, d_height)
+            bot3 = mapper.map_loop(capsule(p0, p1, w_bot, step=step), -d_embed)
+            top3 = mapper.map_loop(capsule(p0, p1, w_top, step=step), d_height)
             if bot3 is None or top3 is None:
                 rep.skipped += 1
                 continue
@@ -305,29 +305,34 @@ def _face_ribs(shape, fid, params, lin_defl, rep):
                 f"rib height {params.height:g} exceeds ~80% of the local "
                 f"curvature radius ({rmin:.1f}) — ribs may self-intersect")
     else:
-        rep.warnings.append("all rib segments failed to build on this face")
+        rep.warnings.append("all rib segments failed to build on this region")
     return solids
 
 
-def build_rib_solids(shape, face_ids, params, lin_defl=0.4):
-    """Build rib solids for the given faces without fusing.
+def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False):
+    """Build rib solids for the selected faces without fusing.
 
+    Connected faces are welded into regions that share one coherent flattened
+    pattern (ribs run continuously across face boundaries).
     Returns (solids, reports). Raises RibbingError if nothing could be built.
     """
     if not face_ids:
         raise RibbingError("no faces selected")
+    regions = region_meshes(shape, face_ids, lin_defl)
+    if not regions:
+        raise RibbingError("selected faces could not be triangulated")
     all_solids, reports = [], []
-    for fid in face_ids:
-        rep = RibReport(face_id=fid)
+    for region in regions:
+        rep = RibReport(face_id=region.face_ids[0], face_ids=region.face_ids)
         reports.append(rep)
         try:
-            all_solids += _face_ribs(shape, fid, params, lin_defl, rep)
+            all_solids += _region_ribs(shape, region, params, rep, stagger)
         except FlattenError as e:
             rep.warnings.append(str(e))
         except RibbingError:
             raise
         except Exception as e:
-            rep.warnings.append(f"face failed: {e}")
+            rep.warnings.append(f"region failed: {e}")
     if not all_solids:
         raise RibbingError("no ribs could be built: "
                            + "; ".join(w for r in reports for w in r.warnings))
@@ -359,6 +364,7 @@ def apply_ribs(shape, face_ids, params, lin_defl=0.4, allow_fallback=True):
 
     Returns (new_shape, reports).
     """
-    all_solids, reports = build_rib_solids(shape, face_ids, params, lin_defl)
+    all_solids, reports = build_rib_solids(shape, face_ids, params, lin_defl,
+                                           stagger=True)
     out = fuse_into(shape, all_solids, reports, allow_fallback)
     return out, reports

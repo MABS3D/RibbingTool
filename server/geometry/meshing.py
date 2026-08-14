@@ -82,3 +82,105 @@ def mesh_shape(shape, lin_defl=0.5, ang_defl=0.5):
         if r is not None:
             out.append(r)
     return out
+
+
+@dataclass
+class RegionMesh:
+    """Welded mesh of one connected multi-face region.
+
+    UVs live per triangle corner (wedge): a welded vertex on a shared edge
+    has different parameters in each adjacent face.
+    """
+    face_ids: list
+    vertices: np.ndarray    # (n,3)
+    triangles: np.ndarray   # (m,3) consistently outward-wound
+    tri_face: np.ndarray    # (m,) face id per triangle
+    wedge_uvs: np.ndarray   # (m,3,2) surface UV per triangle corner
+    all_planar: bool
+
+
+def region_meshes(shape, face_ids, lin_defl=0.4, ang_defl=0.3):
+    """Weld the selected faces' meshes and split into connected regions.
+
+    OCCT discretizes shared edges once, so boundary nodes of adjacent faces
+    coincide exactly and welding by rounded coordinates is reliable.
+    """
+    from .step_io import StepError
+    BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
+    fm = face_map(shape)
+    metas = []
+    for fid in face_ids:
+        if not 1 <= fid <= fm.Size():
+            raise StepError(f"face id {fid} out of range 1..{fm.Size()}")
+        face = TopoDS.Face_s(fm.FindKey(fid))
+        m = face_mesh(face, fid)
+        if m is not None and len(m.triangles):
+            metas.append(m)
+    if not metas:
+        return []
+
+    allv = np.vstack([m.vertices for m in metas])
+    key = np.round(allv / 1e-5).astype(np.int64)
+    _, uniq_idx, inverse = np.unique(key, axis=0, return_index=True,
+                                     return_inverse=True)
+    verts = allv[uniq_idx]
+
+    tris, tri_face, wedge, owners = [], [], [], []
+    off = 0
+    for m in metas:
+        t = inverse[m.triangles + off]
+        tris.append(t)
+        tri_face.append(np.full(len(t), m.face_id))
+        wedge.append(m.uvs[m.triangles])
+        off += len(m.vertices)
+    tris = np.vstack(tris)
+    tri_face = np.concatenate(tri_face)
+    wedge = np.vstack(wedge)
+
+    # connected components over shared welded edges
+    edge_owner = {}
+    n_tri = len(tris)
+    parent = list(range(n_tri))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i, t in enumerate(tris):
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            k = (min(a, b), max(a, b))
+            if k in edge_owner:
+                union(i, edge_owner[k])
+            else:
+                edge_owner[k] = i
+
+    comps = {}
+    for i in range(n_tri):
+        comps.setdefault(find(i), []).append(i)
+
+    planar_ids = {m.face_id for m in metas if m.is_planar}
+    regions = []
+    for idxs in comps.values():
+        idxs = np.asarray(idxs)
+        sub_t = tris[idxs]
+        used = np.unique(sub_t)
+        remap = np.full(len(verts), -1, dtype=np.int64)
+        remap[used] = np.arange(len(used))
+        fids = sorted(set(int(f) for f in tri_face[idxs]))
+        regions.append(RegionMesh(
+            face_ids=fids,
+            vertices=verts[used],
+            triangles=remap[sub_t].astype(np.int32),
+            tri_face=tri_face[idxs],
+            wedge_uvs=wedge[idxs],
+            all_planar=all(f in planar_ids for f in fids),
+        ))
+    regions.sort(key=lambda r: r.face_ids[0])
+    return regions

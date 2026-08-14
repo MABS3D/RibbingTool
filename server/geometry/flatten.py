@@ -56,4 +56,12 @@ def flatten(mesh):
         area2d = -area2d
     scale = np.sqrt(_tri_areas(v, f).sum() / area2d)
     uv = uv * scale
-    return uv - uv.mean(axis=0)
+    uv = uv - uv.mean(axis=0)
+    # LSCM's rotation is arbitrary — align the principal axis with +X so the
+    # pattern orientation is stable and orientation_deg is meaningful.
+    cov = uv.T @ uv
+    _, evecs = np.linalg.eigh(cov)
+    R = evecs[:, ::-1].T          # major axis first
+    if np.linalg.det(R) < 0:
+        R[1] = -R[1]              # keep winding (no mirroring)
+    return uv @ R.T

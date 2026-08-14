@@ -165,6 +165,18 @@ export function setSelection(ids) {
 export function listFaces() {
   return group.children.map((m) => ({ ...m.userData }));
 }
+export function snapshot(width = 640) {
+  // Render synchronously and grab pixels in the same task (no
+  // preserveDrawingBuffer needed).
+  renderer.render(scene, camera);
+  const src = renderer.domElement;
+  const c = document.createElement('canvas');
+  c.width = width;
+  c.height = Math.round(width * src.height / src.width);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.78);
+}
+
 export function lookAtFace(faceId) {
   const mesh = group.children.find((m) => m.userData.faceId === faceId);
   if (!mesh) return false;

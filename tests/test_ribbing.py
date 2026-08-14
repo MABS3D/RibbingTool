@@ -62,8 +62,9 @@ def test_volume_increase_matches_expectation(box_step):
                   height=5, margin=2, embed=0.3)
     out, reports = apply_ribs(s, [fid], p)
     added = shape_volume(out) - shape_volume(s)
-    # 5 ribs x ~56 long x 2 wide x 5 tall = ~2800 mm3 (caps add a little)
-    assert 2000 < added < 4000, added
+    # PCA aligns the 60mm axis with X; the single family stacks across it:
+    # 5 ribs x ~36 long x 2 wide x 5 tall (+ round caps) = ~1880 mm3
+    assert 1500 < added < 2600, added
 
 
 def test_no_faces_error(box_step):

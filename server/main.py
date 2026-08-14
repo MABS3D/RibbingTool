@@ -154,7 +154,8 @@ def api_ribs(req: RibsRequest):
         engine = "exact" if all_planar else "fast"
 
     try:
-        solids, reports = build_rib_solids(entry["shape"], req.face_ids, params)
+        solids, reports = build_rib_solids(entry["shape"], req.face_ids, params,
+                                           stagger=(engine == "exact"))
         if engine == "exact":
             welded = fuse_into(entry["shape"], entry["overlay"] + solids, reports)
             _push(welded, [])
