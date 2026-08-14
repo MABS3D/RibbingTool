@@ -114,7 +114,14 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
     return v, t
 
 
-def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.3):
+def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.5,
+                       max_sew_triangles=25000):
+    """Mesh-union fallback that rebuilds a (faceted) B-rep via sewing.
+
+    Sewing cost grows steeply with triangle count, so the union is
+    simplified first and oversized jobs are refused — those should use the
+    fast engine (overlay + faceted export), which never sews.
+    """
     import manifold3d as m3d
     mans = [_to_manifold(body_shape, lin_defl)]
     for s in rib_solids:
@@ -122,9 +129,18 @@ def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.3):
     man = m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
     if man.is_empty():
         raise BooleanError("mesh boolean union produced empty result")
+    try:
+        man = man.simplify(0.05)
+    except Exception:
+        pass
     mesh = man.to_mesh()
+    tri_verts = np.asarray(mesh.tri_verts, np.int64)
+    if len(tri_verts) > max_sew_triangles:
+        raise BooleanError(
+            f"fallback result too large to rebuild as B-rep "
+            f"({len(tri_verts)} triangles) — use the fast engine for this job")
     return _mesh_to_shape(np.asarray(mesh.vert_properties, float)[:, :3],
-                          np.asarray(mesh.tri_verts, np.int64))
+                          tri_verts)
 
 
 def _mesh_to_shape(v, f):

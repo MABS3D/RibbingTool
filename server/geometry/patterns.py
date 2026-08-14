@@ -149,7 +149,8 @@ def clip_and_border(segments, boundary, params):
     if inset.is_empty:
         return []
     out = []
-    min_len = max(0.5, params.thickness * 0.5)
+    # stubs shorter than ~a thickness read as spiky slivers at region borders
+    min_len = max(1.2, params.thickness * 1.2)
     if segments:
         inter = inset.intersection(MultiLineString([LineString(s) for s in segments]))
         stack = [inter]

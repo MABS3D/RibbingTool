@@ -1,10 +1,11 @@
+import base64
 import io
 import struct
 import tempfile
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -261,6 +262,19 @@ def api_export_stl():
     return Response(_stl_bytes(v, t), media_type="model/stl",
                     headers={"Content-Disposition":
                              f'attachment; filename="{_export_name("stl")}"'})
+
+
+@app.post("/api/dev/snapshot")
+async def api_dev_snapshot(request: Request):
+    """Save a data-URL viewport snapshot to output/ (dev/verification aid)."""
+    data = (await request.body()).decode()
+    if "base64," not in data:
+        raise HTTPException(400, "expected a base64 data URL")
+    out = Path(__file__).resolve().parents[1] / "output"
+    out.mkdir(exist_ok=True)
+    p = out / "ui_snapshot.jpg"
+    p.write_bytes(base64.b64decode(data.split("base64,", 1)[1]))
+    return {"saved": str(p)}
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -115,7 +115,15 @@ class _RegionMapper:
         self.region = region
         self.flat = flat
         self.triangles = region.triangles if triangles is None else triangles
-        self.tree = STRtree([Polygon(flat[t]) for t in self.triangles])
+        # LSCM can fold near boundaries: flipped (negative-area) flat
+        # triangles overlap the valid domain and hijack point location,
+        # stretching ribs into spikes. Only sane triangles may locate points.
+        t = self.triangles
+        e1 = flat[t[:, 1]] - flat[t[:, 0]]
+        e2 = flat[t[:, 2]] - flat[t[:, 0]]
+        signed = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        self.valid_idx = np.nonzero(signed > 1e-12)[0]
+        self.tree = STRtree([Polygon(flat[t[i]]) for i in self.valid_idx])
         self.props = {}
         self.sign = {}
         self.curv = {}
@@ -160,17 +168,20 @@ class _RegionMapper:
         k = len(pts)
         geoms = shapely.points(pts)
         tri_idx = np.full(k, -1, dtype=np.int64)
+        snap = np.zeros(k)
         pi, ti = self.tree.query(geoms, predicate="intersects")
         for p, t in zip(pi, ti):
             if tri_idx[p] < 0:
-                tri_idx[p] = t
+                tri_idx[p] = self.valid_idx[t]
         missing = np.nonzero(tri_idx < 0)[0]
         if len(missing):
             near = self.tree.query_nearest(geoms[missing])
             for p, t in zip(near[0], near[1]):
                 m = missing[p]
                 if tri_idx[m] < 0:
-                    tri_idx[m] = t
+                    tri_idx[m] = self.valid_idx[t]
+                    snap[m] = self.tree.geometries[t].distance(geoms[m])
+        self.last_snap = snap
         tris = self.triangles[tri_idx]
         a, b, c = (self.flat[tris[:, i]] for i in range(3))
         v0, v1, v2 = b - a, c - a, pts - a
@@ -187,10 +198,17 @@ class _RegionMapper:
         bary /= bary.sum(axis=1, keepdims=True)
         return tri_idx, bary
 
-    def map_loop(self, pts2d, offset):
-        """Map a closed 2D loop to 3D at signed normal offset. None on failure."""
+    def map_loop(self, pts2d, offset, max_snap=0.5):
+        """Map a closed 2D loop to 3D at signed normal offset. None on failure.
+
+        Loops with points snapping further than max_snap outside the flat
+        domain are rejected — mapping them stretches ribs along the region
+        border into spike artifacts.
+        """
         pts2d = np.asarray(pts2d, float)
         tri_idx, bary = self._locate(pts2d)
+        if self.last_snap.max() > max_snap:
+            return None
         uvq = np.einsum("kj,kjd->kd", bary, self.region.wedge_uvs[tri_idx])
         out = np.empty((len(uvq), 3))
         normals = np.empty((len(uvq), 3))
@@ -207,6 +225,20 @@ class _RegionMapper:
             return None
         if (normals @ (mean / ln)).min() < _FOLD_COS:
             return None  # crosses a sharp edge / folds >85 deg — unsafe rib
+        # conformal maps preserve angles, not lengths: in highly distorted
+        # zones a small flat segment maps to a monster 3D rib — reject those
+        d2 = np.linalg.norm(np.diff(np.vstack([pts2d, pts2d[:1]]), axis=0),
+                            axis=1)
+        d3 = np.linalg.norm(np.diff(np.vstack([out, out[:1]]), axis=0),
+                            axis=1)
+        p2, p3 = d2.sum(), d3.sum()
+        if p2 > 1e-9 and not (0.4 <= p3 / p2 <= 2.5):
+            return None
+        # a single 3D edge jumping much further than its flat length means
+        # the loop crossed an internal slit — a bowtie rib, not a rib
+        step = max(p2 / max(len(d2), 1), 1e-6)
+        if (d3 - d2).max() > 3.0 * step + 0.8:
+            return None
         return out
 
     def min_curvature_radius(self, pts2d):
@@ -226,6 +258,33 @@ class _RegionMapper:
             except Exception:
                 continue
         return rmin
+
+
+def _folded(bottom, top):
+    """True when the top loop folds/collapses relative to the bottom.
+
+    Offsetting along diverging normals over concave curvature can fold the
+    top outline over itself — those ribs come out crumpled/twisted.
+    """
+    n = (top - bottom).mean(axis=0)
+    ln = np.linalg.norm(n)
+    if ln < 1e-9:
+        return True
+    n = n / ln
+    # build an in-plane 2D frame and compare signed projected areas
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, a)
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    def signed_area(loop):
+        x, y = loop @ u, loop @ v
+        return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+    ab, at = signed_area(bottom), signed_area(top)
+    if ab == 0 or at == 0 or (ab > 0) != (at > 0):
+        return True
+    return not (0.15 <= abs(at) / abs(ab) <= 6.0)
 
 
 def _wire(pts):
@@ -335,7 +394,7 @@ def _region_ribs(shape, region, params, rep, stagger):
         try:
             bot3 = mapper.map_loop(capsule(p0, p1, w_bot, step=step), -d_embed)
             top3 = mapper.map_loop(capsule(p0, p1, w_top, step=step), d_height)
-            if bot3 is None or top3 is None:
+            if bot3 is None or top3 is None or _folded(bot3, top3):
                 rep.skipped += 1
                 continue
             solid = build(bot3, top3)
@@ -394,20 +453,32 @@ def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False):
 
 
 def fuse_into(shape, solids, reports, allow_fallback=True):
-    """Exact-fuse solids into shape with validation; mesh fallback on failure."""
+    """Exact-fuse solids into shape with validation; mesh fallback on failure.
+
+    OCCT mass fuses on curved geometry can 'succeed' with corrupted results
+    (volume loss, invalid shells) — those are detected and retried through
+    the mesh-boolean fallback rather than surfaced as exact output.
+    """
+    v0 = shape_volume(shape)
+    fell_back = False
     try:
         out = _fuse_args([shape], solids)
-    except BooleanError:
+        # volume is the cheap corruption probe — BRepCheck on garbage
+        # geometry can churn for minutes
+        if shape_volume(out) <= v0 + 1e-9:
+            raise BooleanError("fuse produced no volume increase")
+    except BooleanError as e:
         if not allow_fallback:
             raise
         out = mesh_fallback_fuse(shape, solids)
+        fell_back = True
         for r in reports:
             r.warnings.append(
-                "OCCT fuse failed — output is faceted (mesh boolean fallback)")
-    v0, v1 = shape_volume(shape), shape_volume(out)
-    if v1 <= v0 + 1e-9:
+                f"OCCT fuse unreliable here ({e}) — output is faceted "
+                "(mesh boolean fallback)")
+    if shape_volume(out) <= v0 + 1e-9:
         raise RibbingError("ribbing produced no volume increase — fuse failed")
-    if not BRepCheck_Analyzer(out).IsValid():
+    if not fell_back and not BRepCheck_Analyzer(out).IsValid():
         for r in reports:
             r.warnings.append("result failed BRepCheck (may still export fine)")
     return out
