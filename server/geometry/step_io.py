@@ -56,3 +56,85 @@ def shape_volume(shape):
     p = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, p)
     return p.Mass()
+
+
+_FACETED_HEADER = """ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('{name}','2026-01-01T00:00:00',(''),(''),'RibbingTool','','');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN {{ 1 0 10303 214 1 1 1 1 }}'));
+ENDSEC;
+DATA;
+#1=APPLICATION_CONTEXT('core data for automotive mechanical design processes');
+#2=APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#1);
+#3=PRODUCT_CONTEXT('',#1,'mechanical');
+#4=PRODUCT('{name}','{name}','',(#3));
+#5=PRODUCT_DEFINITION_FORMATION('','',#4);
+#6=PRODUCT_DEFINITION_CONTEXT('part definition',#1,'design');
+#7=PRODUCT_DEFINITION('design','',#5,#6);
+#8=PRODUCT_DEFINITION_SHAPE('','',#7);
+#9=(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#13))GLOBAL_UNIT_ASSIGNED_CONTEXT((#10,#11,#12))REPRESENTATION_CONTEXT('',''));
+#10=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));
+#11=(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.));
+#12=(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT());
+#13=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(0.001),#10,'distance_accuracy_value','');
+#14=SHAPE_DEFINITION_REPRESENTATION(#8,#15);
+#15=FACETED_BREP_SHAPE_REPRESENTATION('',(#16,#17),#9);
+#16=AXIS2_PLACEMENT_3D('',#18,$,$);
+#17=FACETED_BREP('',#19);
+#18=CARTESIAN_POINT('',(0.,0.,0.));
+"""
+
+
+def write_faceted_step(path, vertices, triangles, name="ribbed"):
+    """Write a triangle mesh as a FACETED_BREP STEP file (pure text, no OCCT).
+
+    Avoids the prohibitive cost of sewing large meshes back into B-rep just
+    to serialize them. Entity ids: shell #19, faces from #20.
+    """
+    import numpy as np
+    # geometry is serialized at 5 decimals — filter degeneracy on the ROUNDED
+    # coords, or rounding re-creates the slivers we filtered
+    v = np.round(np.asarray(vertices, float), 5)
+    t = np.asarray(triangles)
+    e1 = v[t[:, 1]] - v[t[:, 0]]
+    e2 = v[t[:, 2]] - v[t[:, 0]]
+    e3 = v[t[:, 2]] - v[t[:, 1]]
+    nrm = np.cross(e1, e2)
+    nlen = np.linalg.norm(nrm, axis=1)
+    ok = ((nlen > 1e-6)
+          & (np.linalg.norm(e1, axis=1) > 1e-4)
+          & (np.linalg.norm(e2, axis=1) > 1e-4)
+          & (np.linalg.norm(e3, axis=1) > 1e-4))
+    t, e1, nrm, nlen = t[ok], e1[ok], nrm[ok], nlen[ok]
+    nrm = nrm / nlen[:, None]
+    ref = e1 / np.linalg.norm(e1, axis=1, keepdims=True).clip(1e-12)
+
+    lines = [_FACETED_HEADER.format(name=name)]
+    nid = 20
+    pt_ids = np.empty(len(v), dtype=np.int64)
+    for i, (x, y, z) in enumerate(v):
+        pt_ids[i] = nid
+        lines.append(f"#{nid}=CARTESIAN_POINT('',({x:.5f},{y:.5f},{z:.5f}));\n")
+        nid += 1
+    face_ids = []
+    for k, (a, b, c) in enumerate(t):
+        n, r = nrm[k], ref[k]
+        loop, bound = nid, nid + 1
+        dn, dr, ax, pl, face = nid + 2, nid + 3, nid + 4, nid + 5, nid + 6
+        nid += 7
+        lines.append(
+            f"#{loop}=POLY_LOOP('',(#{pt_ids[a]},#{pt_ids[b]},#{pt_ids[c]}));\n"
+            f"#{bound}=FACE_OUTER_BOUND('',#{loop},.T.);\n"
+            f"#{dn}=DIRECTION('',({n[0]:.7f},{n[1]:.7f},{n[2]:.7f}));\n"
+            f"#{dr}=DIRECTION('',({r[0]:.7f},{r[1]:.7f},{r[2]:.7f}));\n"
+            f"#{ax}=AXIS2_PLACEMENT_3D('',#{pt_ids[a]},#{dn},#{dr});\n"
+            f"#{pl}=PLANE('',#{ax});\n"
+            f"#{face}=FACE_SURFACE('',(#{bound}),#{pl},.T.);\n")
+        face_ids.append(face)
+    # STEP physical files dislike very long lines — wrap the shell's face list
+    refs = [f"#{i}" for i in face_ids]
+    chunks = [",".join(refs[i:i + 16]) for i in range(0, len(refs), 16)]
+    lines.append("#19=CLOSED_SHELL('',(" + ",\n".join(chunks) + "));\n")
+    lines.append("ENDSEC;\nEND-ISO-10303-21;\n")
+    Path(path).write_text("".join(lines), encoding="ascii")

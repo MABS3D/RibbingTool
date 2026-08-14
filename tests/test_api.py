@@ -44,6 +44,14 @@ def test_ribs_undo_export(box_step):
     assert r.status_code == 400
 
 
+def test_load_path(box_step):
+    c = TestClient(app)
+    r = c.post("/api/load_path", json={"path": str(box_step)})
+    assert r.status_code == 200 and r.json()["nfaces"] == 6
+    r = c.post("/api/load_path", json={"path": "Z:/does/not/exist.step"})
+    assert r.status_code == 400
+
+
 def test_bad_face(box_step):
     c = TestClient(app)
     _load(c, box_step)

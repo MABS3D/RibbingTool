@@ -309,8 +309,11 @@ def _face_ribs(shape, fid, params, lin_defl, rep):
     return solids
 
 
-def apply_ribs(shape, face_ids, params, lin_defl=0.4, allow_fallback=True):
-    """Apply the rib pattern to the given faces. Returns (new_shape, reports)."""
+def build_rib_solids(shape, face_ids, params, lin_defl=0.4):
+    """Build rib solids for the given faces without fusing.
+
+    Returns (solids, reports). Raises RibbingError if nothing could be built.
+    """
     if not face_ids:
         raise RibbingError("no faces selected")
     all_solids, reports = [], []
@@ -328,12 +331,17 @@ def apply_ribs(shape, face_ids, params, lin_defl=0.4, allow_fallback=True):
     if not all_solids:
         raise RibbingError("no ribs could be built: "
                            + "; ".join(w for r in reports for w in r.warnings))
+    return all_solids, reports
+
+
+def fuse_into(shape, solids, reports, allow_fallback=True):
+    """Exact-fuse solids into shape with validation; mesh fallback on failure."""
     try:
-        out = _fuse_args([shape], all_solids)
+        out = _fuse_args([shape], solids)
     except BooleanError:
         if not allow_fallback:
             raise
-        out = mesh_fallback_fuse(shape, all_solids)
+        out = mesh_fallback_fuse(shape, solids)
         for r in reports:
             r.warnings.append(
                 "OCCT fuse failed — output is faceted (mesh boolean fallback)")
@@ -343,4 +351,14 @@ def apply_ribs(shape, face_ids, params, lin_defl=0.4, allow_fallback=True):
     if not BRepCheck_Analyzer(out).IsValid():
         for r in reports:
             r.warnings.append("result failed BRepCheck (may still export fine)")
+    return out
+
+
+def apply_ribs(shape, face_ids, params, lin_defl=0.4, allow_fallback=True):
+    """Build ribs and fuse them into the body (exact engine).
+
+    Returns (new_shape, reports).
+    """
+    all_solids, reports = build_rib_solids(shape, face_ids, params, lin_defl)
+    out = fuse_into(shape, all_solids, reports, allow_fallback)
     return out, reports

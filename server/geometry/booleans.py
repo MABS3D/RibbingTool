@@ -90,6 +90,30 @@ def _to_manifold(shape, lin_defl):
     return man
 
 
+def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
+    """Union body + ribs in mesh space. Returns (vertices, triangles) arrays.
+
+    No B-rep reconstruction — orders of magnitude faster than OCCT fuse at
+    scale; the result is faceted (for STL and faceted-STEP export).
+    """
+    import manifold3d as m3d
+    mans = [_to_manifold(body_shape, lin_defl)]
+    for s in rib_solids:
+        mans.append(_to_manifold(s, lin_defl))
+    man = m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
+    if man.is_empty():
+        raise BooleanError("mesh boolean union produced empty result")
+    if simplify_tol:
+        try:
+            man = man.simplify(simplify_tol)
+        except Exception:
+            pass
+    mesh = man.to_mesh()
+    v = np.asarray(mesh.vert_properties, np.float64)[:, :3]
+    t = np.asarray(mesh.tri_verts, np.int64)
+    return v, t
+
+
 def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.3):
     import manifold3d as m3d
     mans = [_to_manifold(body_shape, lin_defl)]
