@@ -71,7 +71,10 @@ def _shape_to_mesh(shape, lin_defl):
     return np.array(V, np.float64), np.array(F, np.int64)
 
 
-def _weld(v, f, tol=1e-3):
+def _weld(v, f, tol=1e-6):
+    # OCCT discretizes shared edges once, so coincident nodes are
+    # bit-identical: weld exact duplicates only. Coarser tolerances collapse
+    # tiny triangles at fine deflections and hole the mesh (non-manifold).
     key = np.round(v / tol).astype(np.int64)
     _, idx, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
     f2 = inv[f]
@@ -90,28 +93,56 @@ def _to_manifold(shape, lin_defl):
     return man
 
 
-def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
-    """Union body + ribs in mesh space. Returns (vertices, triangles) arrays.
-
-    No B-rep reconstruction — orders of magnitude faster than OCCT fuse at
-    scale; the result is faceted (for STL and faceted-STEP export).
-    """
-    import manifold3d as m3d
-    mans = [_to_manifold(body_shape, lin_defl)]
-    for s in rib_solids:
-        mans.append(_to_manifold(s, lin_defl))
-    man = m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
-    if man.is_empty():
-        raise BooleanError("mesh boolean union produced empty result")
+def _man_to_arrays(man, simplify_tol):
     if simplify_tol:
         try:
             man = man.simplify(simplify_tol)
         except Exception:
             pass
     mesh = man.to_mesh()
-    v = np.asarray(mesh.vert_properties, np.float64)[:, :3]
-    t = np.asarray(mesh.tri_verts, np.int64)
-    return v, t
+    return (np.asarray(mesh.vert_properties, np.float64)[:, :3],
+            np.asarray(mesh.tri_verts, np.int64))
+
+
+def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
+    """Union body + ribs in mesh space. Returns a list of (verts, tris) shells.
+
+    One watertight shell when everything unions; when the body tessellation
+    defeats manifold3d (real B-reps can carry non-manifold junctions), fall
+    back to two overlapping shells — body + unioned rib lattice — which
+    slicers merge natively.
+    """
+    import manifold3d as m3d
+    body_man = None
+    try:
+        body_man = _to_manifold(body_shape, lin_defl)
+    except BooleanError:
+        pass
+    rib_mans = []
+    for s in rib_solids:
+        try:
+            rib_mans.append(_to_manifold(s, lin_defl))
+        except BooleanError:
+            continue
+    if not rib_mans and body_man is None:
+        raise BooleanError("no meshable geometry to union")
+
+    if body_man is not None:
+        man = m3d.Manifold.batch_boolean([body_man] + rib_mans, m3d.OpType.Add)
+        if not man.is_empty():
+            return [_man_to_arrays(man, simplify_tol)]
+
+    shells = []
+    v, f = _weld(*_shape_to_mesh(body_shape, lin_defl))
+    shells.append((v.astype(np.float64), f.astype(np.int64)))
+    if rib_mans:
+        lattice = m3d.Manifold.batch_boolean(rib_mans, m3d.OpType.Add)
+        if not lattice.is_empty():
+            shells.append(_man_to_arrays(lattice, simplify_tol))
+        else:
+            for rm in rib_mans:
+                shells.append(_man_to_arrays(rm, None))
+    return shells
 
 
 def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.5,

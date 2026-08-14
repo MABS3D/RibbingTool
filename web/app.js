@@ -82,6 +82,7 @@ function gatherParams() {
     draft_deg: num('draft'),
     margin: num('margin'),
     border: $('border').checked,
+    taper_len: num('taper'),
     density: num('density'),
     seed: num('seed'),
   };

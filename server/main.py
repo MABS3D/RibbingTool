@@ -222,10 +222,19 @@ def _stl_bytes(v, t):
     return buf.getvalue()
 
 
-def _union_mesh():
+def _union_shells():
     """Body + overlay unioned in mesh space (fine tessellation for export)."""
     entry = _entry()
     return mesh_union(entry["shape"], entry["overlay"], lin_defl=0.2)
+
+
+def _concat_shells(shells):
+    vs, ts, off = [], [], 0
+    for v, t in shells:
+        vs.append(v)
+        ts.append(np.asarray(t, np.int64) + off)
+        off += len(v)
+    return np.vstack(vs), np.vstack(ts)
 
 
 @app.get("/api/export/step")
@@ -235,8 +244,8 @@ def api_export_step():
     entry = _entry()
     out = Path(tempfile.gettempdir()) / "ribbingtool_export.step"
     if entry["overlay"]:
-        v, t = _union_mesh()
-        write_faceted_step(out, v, t,
+        shells = _union_shells()
+        write_faceted_step(out, shells=shells,
                            name=(STATE["filename"] or "model").rsplit(".", 1)[0])
     else:
         save_step(entry["shape"], out)
@@ -250,7 +259,7 @@ def api_export_stl():
         raise HTTPException(400, "no model loaded")
     entry = _entry()
     if entry["overlay"]:
-        v, t = _union_mesh()
+        v, t = _concat_shells(_union_shells())
     else:
         meshes = STATE["meshes"] or mesh_shape(entry["shape"], 0.2, 0.3)
         vs, ts, off = [], [], 0

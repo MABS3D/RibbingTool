@@ -31,7 +31,9 @@ Open http://localhost:8317 and load a STEP file.
    through rounded wall ends onto the far side of a shell.
 3. **Pattern + parameters** — rectangular, quadmesh, triangular, isogrid,
    hexagonal, stochastic (seeded Voronoi); spacing, thickness, height,
-   orientation, draft, boundary margin, optional border rib.
+   orientation, draft, boundary margin, optional border rib (welds open rib
+   ends into one frame), edge taper (without a border, rib height ramps to
+   zero over `taper_len` mm at open boundaries — stiffener run-outs).
 4. **Apply.** Connected selected faces are welded into one region and
    flattened together (LSCM), so the pattern flows continuously across face
    boundaries with a single coherent orientation.
@@ -82,6 +84,14 @@ counted in the per-region report.
 - Closed periodic faces (full cylinders) unroll at their CAD seam; the
   pattern does not join across the seam line.
 - Single solid per file (assemblies: only the first solid is used).
+
+## Roadmap
+
+V2 direction (see `docs/superpowers/specs/2026-08-14-v2-stress-aligned-roadmap.md`):
+load-driven rib layouts per Li et al. 2017 (*Rib-reinforced Shell
+Structure*: FEA → principal-stress-aligned quad mesh → rib network →
+contribution-based simplification → T-sections) and Ding & Yamazaki 2005
+(adaptive growth stiffeners).
 
 ## Tests
 

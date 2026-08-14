@@ -199,13 +199,15 @@ class _RegionMapper:
         return tri_idx, bary
 
     def map_loop(self, pts2d, offset, max_snap=0.5):
-        """Map a closed 2D loop to 3D at signed normal offset. None on failure.
+        """Map a closed 2D loop to 3D at signed normal offset(s).
 
-        Loops with points snapping further than max_snap outside the flat
-        domain are rejected — mapping them stretches ribs along the region
-        border into spike artifacts.
+        offset may be a scalar or a per-point array (rib run-out tapering).
+        None on failure. Loops with points snapping further than max_snap
+        outside the flat domain are rejected — mapping them stretches ribs
+        along the region border into spike artifacts.
         """
         pts2d = np.asarray(pts2d, float)
+        offset = np.broadcast_to(np.asarray(offset, float), (len(pts2d),))
         tri_idx, bary = self._locate(pts2d)
         if self.last_snap.max() > max_snap:
             return None
@@ -217,7 +219,7 @@ class _RegionMapper:
             p, n = self._eval(fid, uvq[i, 0], uvq[i, 1])
             if p is None:
                 return None
-            out[i] = p + n * offset
+            out[i] = p + n * offset[i]
             normals[i] = n
         mean = normals.mean(axis=0)
         ln = np.linalg.norm(mean)
@@ -382,6 +384,24 @@ def _region_ribs(shape, region, params, rep, stagger):
                 w_bot * 0.05, 1e-3)
     step = float(np.clip(params.spacing / 5.0, 0.8, 2.0))
     build = _loft if region.all_planar else _sew_rib
+
+    # run-out tapering: with no border rib, rib height ramps to ~0 towards
+    # the open boundary instead of ending abruptly
+    import shapely as _shp
+    taper = params.taper_len > 0 and not params.border
+    bnd_line = boundary.buffer(-params.margin).boundary if taper else None
+    # thin run-out tips are poison for the exact OCCT fuse (stagger=True):
+    # keep them a bit taller there
+    f_min = 0.3 if stagger else 0.05
+
+    def top_offsets(pts2d, full_height):
+        if not taper:
+            return full_height
+        d = _shp.distance(_shp.points(np.asarray(pts2d)), bnd_line)
+        if d.min() >= params.taper_len:
+            return full_height
+        return full_height * np.clip(d / params.taper_len, f_min, 1.0)
+
     solids = []
     for i, (p0, p1) in enumerate(subsegs):
         # Staggered offsets keep tangent cap contacts out of the exact OCCT
@@ -393,11 +413,15 @@ def _region_ribs(shape, region, params, rep, stagger):
             d_embed, d_height = params.embed, params.height
         try:
             bot3 = mapper.map_loop(capsule(p0, p1, w_bot, step=step), -d_embed)
-            top3 = mapper.map_loop(capsule(p0, p1, w_top, step=step), d_height)
+            top2 = capsule(p0, p1, w_top, step=step)
+            off = top_offsets(top2, d_height)
+            top3 = mapper.map_loop(top2, off)
             if bot3 is None or top3 is None or _folded(bot3, top3):
                 rep.skipped += 1
                 continue
-            solid = build(bot3, top3)
+            # tapered tops are non-planar: ThruSections cannot cap them
+            rib_build = _sew_rib if isinstance(off, np.ndarray) else build
+            solid = rib_build(bot3, top3)
             if not BRepCheck_Analyzer(solid).IsValid():
                 rep.skipped += 1
                 continue

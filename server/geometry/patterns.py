@@ -21,6 +21,7 @@ class RibParams:
     density: float = 0.008
     seed: int = 1
     base_angle_deg: float = 0.0
+    taper_len: float = 5.0   # run-out length at open boundaries (0 = off)
 
     @classmethod
     def from_dict(cls, d):
