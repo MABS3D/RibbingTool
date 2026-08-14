@@ -467,12 +467,16 @@ def _region_ribs(shape, region, params, rep, stagger, quality=1.0):
     return solids
 
 
-def _map_points(mapper, pts2d, offsets):
-    """Raw per-point surface mapping (no loop guards). None on failure."""
+def _map_points(mapper, pts2d, offsets, max_snap=0.5):
+    """Raw per-point surface mapping (no loop guards). None on failure.
+
+    max_snap=None skips the out-of-domain gate; the caller can inspect
+    mapper.last_snap per point instead.
+    """
     pts2d = np.asarray(pts2d, float)
     offsets = np.broadcast_to(np.asarray(offsets, float), (len(pts2d),))
     tri_idx, bary = mapper._locate(pts2d)
-    if mapper.last_snap.max() > 0.5:
+    if max_snap is not None and mapper.last_snap.max() > max_snap:
         return None
     uvq = np.einsum("kj,kjd->kd", bary, mapper.region.wedge_uvs[tri_idx])
     out = np.empty((len(uvq), 3))
@@ -485,12 +489,15 @@ def _map_points(mapper, pts2d, offsets):
     return out
 
 
-def _cluster_mesh(mapper, poly, params, top_offsets, step, quality):
+def _cluster_mesh(mapper, poly, params, top_offsets, step, quality,
+                  strict=False):
     """One watertight triangle mesh for a merged 2D footprint cluster.
 
     Crossing ribs built as separate solids leave micro-steps and sliver
     scars where their nearly-coplanar tops get unioned; merging footprints
     in 2D first makes every junction a single seamless surface.
+    Returns None when the triangulation or the mapping is untrustworthy —
+    the caller falls back to per-segment building with strict guards.
     """
     import manifold3d as m3d
     from shapely.geometry.polygon import orient
@@ -515,10 +522,40 @@ def _cluster_mesh(mapper, poly, params, top_offsets, step, quality):
     tris = np.asarray(m3d.triangulate([r.astype(np.float64) for r in rings2d]),
                       np.int64)
 
+    # triangulate() does not fail loudly on eps-invalid rings — it emits
+    # overlapping junk (curtains across holes). The signed areas must be
+    # non-negative and sum to the RESAMPLED rings' shoelace area (the exact
+    # polygon differs legitimately where arcs got corner-cut).
+    def shoelace(r):
+        x, y = r[:, 0], r[:, 1]
+        return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+    ref_area = sum(shoelace(r) for r in rings2d)
+    e1 = verts2d[tris[:, 1]] - verts2d[tris[:, 0]]
+    e2 = verts2d[tris[:, 2]] - verts2d[tris[:, 0]]
+    signed = 0.5 * (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0])
+    if len(signed) == 0 or signed.min() < -1e-9 or ref_area <= 0:
+        return None
+    ok_tris = signed > 1e-9                # drop collinear-sample degenerates
+    tris = tris[ok_tris]
+    if abs(signed.sum() - ref_area) > max(0.5, 0.01 * ref_area):
+        return None
+
     bot3 = _map_points(mapper, verts2d, -params.embed)
     top3 = _map_points(mapper, verts2d, top_offsets(verts2d, params.height))
     if bot3 is None or top3 is None:
         return None
+
+    if strict:
+        # per-segment fallback: reject conformal-stretch monsters outright
+        edges = np.unique(np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]],
+                                             tris[:, [2, 0]]]), axis=1), axis=0)
+        d2 = np.linalg.norm(verts2d[edges[:, 0]] - verts2d[edges[:, 1]], axis=1)
+        d3 = np.linalg.norm(top3[edges[:, 0]] - top3[edges[:, 1]], axis=1)
+        keep = d2 > 1e-9
+        ratio = d3[keep] / d2[keep]
+        if len(ratio) and (ratio.max() > 1.8 or ratio.min() < 0.55):
+            return None
 
     nb = len(verts2d)
     v = np.vstack([bot3, top3])            # bottom block, then top block
@@ -582,13 +619,36 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
             bnd_line = (boundary.buffer(-params.margin).boundary
                         if taper else None)
 
+            # taper floor: sub-0.35mm tips render/print as chewed slivers
+            f_min = float(min(0.5, 0.35 / max(params.height, 0.1)))
+
             def top_offsets(pts2d, full_height):
                 if not taper:
                     return full_height
                 d = _shp.distance(_shp.points(np.asarray(pts2d)), bnd_line)
                 if d.min() >= params.taper_len:
                     return full_height
-                return full_height * np.clip(d / params.taper_len, 0.05, 1.0)
+                return full_height * np.clip(d / params.taper_len, f_min, 1.0)
+
+            # prefilter conformal-stretch monsters BEFORE clustering: one
+            # pinched segment must not poison a lattice-wide cluster
+            ends = np.array([[s[0], s[1]] for s in subsegs], float)
+            flat_len = np.linalg.norm(ends[:, 1] - ends[:, 0], axis=1)
+            m0 = _map_points(mapper, ends[:, 0], 0.0, max_snap=None)
+            snap0 = mapper.last_snap.copy()
+            m1 = _map_points(mapper, ends[:, 1], 0.0, max_snap=None)
+            snap1 = mapper.last_snap.copy()
+            if m0 is None or m1 is None:
+                raise RibbingError("region mapping failed")
+            ratio = (np.linalg.norm(m1 - m0, axis=1)
+                     / np.clip(flat_len, 1e-9, None))
+            sane = ((ratio >= 0.55) & (ratio <= 1.8)
+                    & (snap0 <= 0.5) & (snap1 <= 0.5))
+            rep.skipped += int((~sane).sum())
+            subsegs = [s for s, ok in zip(subsegs, sane) if ok]
+            if not subsegs:
+                rep.warnings.append("all segments in over-distorted zones")
+                continue
 
             caps = [ShpPolygon(capsule(p0, p1, w_bot, step=step))
                     for p0, p1 in subsegs]
@@ -597,17 +657,32 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                      if p.area > 1e-6]
             reps_pts = [c.representative_point() for c in caps]
             for poly in polys:
-                seg_count = sum(1 for rp in reps_pts if poly.contains(rp))
+                members = [i for i, rp in enumerate(reps_pts)
+                           if poly.contains(rp)]
                 try:
                     mesh = _cluster_mesh(mapper, poly, params, top_offsets,
                                          step, quality)
                 except Exception:
                     mesh = None
-                if mesh is None:
-                    rep.skipped += seg_count
-                else:
+                if mesh is not None:
                     clusters.append(mesh)
-                    rep.lofted += seg_count
+                    rep.lofted += len(members)
+                    continue
+                # cluster untrustworthy (eps-invalid ring, pinched-zone
+                # stretch): rebuild its segments individually with strict
+                # guards — monsters get skipped, sane ribs survive
+                for i in members:
+                    try:
+                        seg_mesh = _cluster_mesh(
+                            mapper, caps[i], params, top_offsets, step,
+                            quality, strict=True)
+                    except Exception:
+                        seg_mesh = None
+                    if seg_mesh is None:
+                        rep.skipped += 1
+                    else:
+                        clusters.append(seg_mesh)
+                        rep.lofted += 1
         except FlattenError as e:
             rep.warnings.append(str(e))
         except RibbingError:
