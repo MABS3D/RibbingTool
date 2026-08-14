@@ -16,6 +16,7 @@ from .geometry.meshing import mesh_shape
 from .geometry.patterns import RibParams
 from .geometry.ribbing import (
     RibbingError,
+    build_rib_meshes,
     build_rib_solids,
     fuse_into,
 )
@@ -65,45 +66,23 @@ def _entry():
 
 
 def _overlay_mesh(overlay, lin_defl=0.35):
-    """Rib overlay as one display mesh — unioned, so junctions read welded.
+    """Rib overlay as one display mesh.
 
-    Un-unioned solids interpenetrate visibly where ribs cross; the union is
-    also what exports produce, so the viewer shows the true result.
+    Cluster meshes (verts, tris) are disjoint and junction-free by
+    construction — plain concatenation. Legacy OCCT solids are meshed.
     """
     if not overlay:
         return None
-    import manifold3d as m3d
-    from .geometry.booleans import BooleanError, _to_manifold
-    mans, leftovers = [], []
-    for s in overlay:
-        try:
-            mans.append(_to_manifold(s, lin_defl))
-        except BooleanError:
-            leftovers.append(s)
     vs, ts, off = [], [], 0
-    if mans:
-        try:
-            man = m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
-            try:
-                man = man.simplify(0.03)
-            except Exception:
-                pass
-            mesh = man.to_mesh()
-            v = np.asarray(mesh.vert_properties, np.float64)[:, :3]
-            t = np.asarray(mesh.tri_verts, np.int64)
-            if len(v):
-                vs.append(v)
-                ts.append(t)
-                off = len(v)
-        except Exception:
-            leftovers = list(overlay)
-            vs, ts, off = [], [], 0
-    for s in leftovers:
-        v, t = _shape_to_mesh(s, lin_defl)
+    for s in overlay:
+        if isinstance(s, tuple):
+            v, t = s
+        else:
+            v, t = _shape_to_mesh(s, lin_defl)
         if len(v) == 0:
             continue
-        vs.append(v)
-        ts.append(t + off)
+        vs.append(np.asarray(v, np.float64))
+        ts.append(np.asarray(t, np.int64) + off)
         off += len(v)
     if not vs:
         return None
@@ -216,13 +195,15 @@ def api_ribs(req: RibsRequest):
         engine = "exact" if all_planar else "fast"
 
     try:
-        solids, reports = build_rib_solids(entry["shape"], req.face_ids, params,
-                                           stagger=(engine == "exact"))
         if engine == "exact":
+            solids, reports = build_rib_solids(entry["shape"], req.face_ids,
+                                               params, stagger=True)
             welded = fuse_into(entry["shape"], entry["overlay"] + solids, reports)
             _push(welded, [], [])
         else:
-            _push(entry["shape"], entry["overlay"] + solids,
+            clusters, reports = build_rib_meshes(entry["shape"], req.face_ids,
+                                                 params)
+            _push(entry["shape"], entry["overlay"] + clusters,
                   entry["recipes"] + [{"face_ids": list(req.face_ids),
                                        "params": dict(req.params)}])
     except (RibbingError, FlattenError, BooleanError, StepError, ValueError) as e:
@@ -279,13 +260,13 @@ def _union_shells():
         try:
             fine = []
             for rec in entry["recipes"]:
-                s, _ = build_rib_solids(entry["shape"], rec["face_ids"],
+                s, _ = build_rib_meshes(entry["shape"], rec["face_ids"],
                                         RibParams.from_dict(rec["params"]),
                                         quality=3.0)
                 fine += s
             solids = fine
         except Exception:
-            pass  # fall back to the interactive-quality overlay solids
+            pass  # fall back to the interactive-quality overlay meshes
     shells = mesh_union(entry["shape"], solids, lin_defl=0.2)
     entry["fine_shells"] = shells
     return shells

@@ -467,6 +467,159 @@ def _region_ribs(shape, region, params, rep, stagger, quality=1.0):
     return solids
 
 
+def _map_points(mapper, pts2d, offsets):
+    """Raw per-point surface mapping (no loop guards). None on failure."""
+    pts2d = np.asarray(pts2d, float)
+    offsets = np.broadcast_to(np.asarray(offsets, float), (len(pts2d),))
+    tri_idx, bary = mapper._locate(pts2d)
+    if mapper.last_snap.max() > 0.5:
+        return None
+    uvq = np.einsum("kj,kjd->kd", bary, mapper.region.wedge_uvs[tri_idx])
+    out = np.empty((len(uvq), 3))
+    for i in range(len(uvq)):
+        fid = int(mapper.region.tri_face[tri_idx[i]])
+        p, n = mapper._eval(fid, uvq[i, 0], uvq[i, 1])
+        if p is None:
+            return None
+        out[i] = p + n * offsets[i]
+    return out
+
+
+def _cluster_mesh(mapper, poly, params, top_offsets, step, quality):
+    """One watertight triangle mesh for a merged 2D footprint cluster.
+
+    Crossing ribs built as separate solids leave micro-steps and sliver
+    scars where their nearly-coplanar tops get unioned; merging footprints
+    in 2D first makes every junction a single seamless surface.
+    """
+    import manifold3d as m3d
+    from shapely.geometry.polygon import orient
+
+    poly = orient(poly, 1.0)               # exterior CCW, holes CW
+    rings2d, ranges = [], []
+    start = 0
+    for ring in [poly.exterior, *poly.interiors]:
+        L = ring.length
+        probe = np.array([ring.interpolate(f * L).coords[0]
+                          for f in (0.0, 0.33, 0.66)])
+        r_loc = mapper.min_curvature_radius(probe)
+        step_r = step if math.isinf(r_loc) else float(
+            np.clip(0.07 * r_loc, 0.3 / max(quality, 1.0), step))
+        n = max(8, int(math.ceil(L / step_r)))
+        pts = np.array([ring.interpolate(i * L / n).coords[0]
+                        for i in range(n)])
+        rings2d.append(pts)
+        ranges.append((start, n))
+        start += n
+    verts2d = np.vstack(rings2d)
+    tris = np.asarray(m3d.triangulate([r.astype(np.float64) for r in rings2d]),
+                      np.int64)
+
+    bot3 = _map_points(mapper, verts2d, -params.embed)
+    top3 = _map_points(mapper, verts2d, top_offsets(verts2d, params.height))
+    if bot3 is None or top3 is None:
+        return None
+
+    nb = len(verts2d)
+    v = np.vstack([bot3, top3])            # bottom block, then top block
+    faces = []
+    for a, b, c in tris:
+        faces.append((a + nb, b + nb, c + nb))   # top faces up
+        faces.append((a, c, b))                  # bottom faces down
+    for off, n in ranges:
+        for i in range(n):
+            a = off + i
+            b = off + (i + 1) % n
+            faces.append((a, b, b + nb))
+            faces.append((a, b + nb, a + nb))
+    return v, np.asarray(faces, np.int64)
+
+
+def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
+    """Fast-engine rib builder: watertight cluster meshes, junction-free.
+
+    Merges crossing capsule footprints in 2D per region, builds each
+    connected cluster as one triangle mesh (no OCCT solids, no booleans).
+    Returns (clusters:[(verts, tris)], reports).
+    """
+    from shapely.geometry import Polygon as ShpPolygon
+    from shapely.ops import unary_union
+
+    if not face_ids:
+        raise RibbingError("no faces selected")
+    if len(face_ids) > 25:
+        lin_defl = max(lin_defl, 0.7)
+    regions = region_meshes(shape, face_ids, lin_defl)
+    if not regions:
+        raise RibbingError("selected faces could not be triangulated")
+    clusters, reports = [], []
+    for region in regions:
+        rep = RibReport(face_id=region.face_ids[0], face_ids=region.face_ids)
+        reports.append(rep)
+        try:
+            flat, map_tris = _flatten_with_cuts(region)
+            boundary = _flat_boundary(map_tris, flat)
+            lines = clip_and_border(generate_segments(params, boundary.bounds),
+                                    boundary, params)
+            subsegs = []
+            for ls in lines:
+                cs = list(ls.coords)
+                subsegs += [(cs[i], cs[i + 1]) for i in range(len(cs) - 1)]
+            if not subsegs:
+                rep.warnings.append("pattern produced no ribs on this region")
+                continue
+            if len(subsegs) > MAX_SEGMENTS:
+                raise RibbingError(
+                    f"pattern produces {len(subsegs)} rib segments "
+                    f"(max {MAX_SEGMENTS}) — increase spacing or lower density")
+            rep.segments = len(subsegs)
+
+            mapper = _RegionMapper(region, flat, shape, triangles=map_tris)
+            step = float(np.clip(params.spacing / 6.0, 0.7, 1.5))
+            w_bot = params.thickness / 2.0
+            import shapely as _shp
+            taper = params.taper_len > 0 and not params.border
+            bnd_line = (boundary.buffer(-params.margin).boundary
+                        if taper else None)
+
+            def top_offsets(pts2d, full_height):
+                if not taper:
+                    return full_height
+                d = _shp.distance(_shp.points(np.asarray(pts2d)), bnd_line)
+                if d.min() >= params.taper_len:
+                    return full_height
+                return full_height * np.clip(d / params.taper_len, 0.05, 1.0)
+
+            caps = [ShpPolygon(capsule(p0, p1, w_bot, step=step))
+                    for p0, p1 in subsegs]
+            merged = unary_union(caps)
+            polys = [p for p in getattr(merged, "geoms", [merged])
+                     if p.area > 1e-6]
+            reps_pts = [c.representative_point() for c in caps]
+            for poly in polys:
+                seg_count = sum(1 for rp in reps_pts if poly.contains(rp))
+                try:
+                    mesh = _cluster_mesh(mapper, poly, params, top_offsets,
+                                         step, quality)
+                except Exception:
+                    mesh = None
+                if mesh is None:
+                    rep.skipped += seg_count
+                else:
+                    clusters.append(mesh)
+                    rep.lofted += seg_count
+        except FlattenError as e:
+            rep.warnings.append(str(e))
+        except RibbingError:
+            raise
+        except Exception as e:
+            rep.warnings.append(f"region failed: {e}")
+    if not clusters:
+        raise RibbingError("no ribs could be built: "
+                           + "; ".join(w for r in reports for w in r.warnings))
+    return clusters, reports
+
+
 def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False,
                      quality=1.0):
     """Build rib solids for the selected faces without fusing.

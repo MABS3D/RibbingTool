@@ -121,8 +121,14 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
     rib_mans = []
     for s in rib_solids:
         try:
-            rib_mans.append(_to_manifold(s, lin_defl))
-        except BooleanError:
+            if isinstance(s, tuple):
+                v, f = s   # watertight cluster mesh, indices already shared
+                rib_mans.append(m3d.Manifold(
+                    m3d.Mesh(np.ascontiguousarray(v, np.float32),
+                             np.ascontiguousarray(f, np.uint32))))
+            else:
+                rib_mans.append(_to_manifold(s, lin_defl))
+        except Exception:
             continue
     if not rib_mans and body_man is None:
         raise BooleanError("no meshable geometry to union")
