@@ -43,7 +43,8 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 # Stack of model states. Each entry:
 #   shape:   B-rep body (never modified by the fast engine)
 #   overlay: list of un-fused rib solids sitting on the body (fast engine)
-STATE = {"stack": [], "filename": None, "meshes": None}
+# frame_cache keeps projected applies on one lattice frame per model.
+STATE = {"stack": [], "filename": None, "meshes": None, "frame_cache": {}}
 
 
 class RibsRequest(BaseModel):
@@ -134,6 +135,7 @@ def _push(shape, overlay, recipes):
 def _load_shape(shape, filename):
     STATE["stack"] = [{"shape": shape, "overlay": [], "recipes": []}]
     STATE["filename"] = filename
+    STATE["frame_cache"] = {}
     return _mesh_payload()
 
 
@@ -173,7 +175,7 @@ def api_grow(req: GrowRequest):
     from .geometry.selection import grow_tangent
     try:
         grown = grow_tangent(_entry()["shape"], req.face_ids,
-                             angle_deg=req.angle_deg)
+                             angle_deg=max(5.0, min(60.0, req.angle_deg)))
     except Exception as e:
         raise HTTPException(400, f"selection growth failed: {e}")
     return {"face_ids": grown}
@@ -204,7 +206,8 @@ def api_ribs(req: RibsRequest):
             _push(welded, [], [])
         else:
             clusters, reports = build_rib_meshes(entry["shape"], req.face_ids,
-                                                 params)
+                                                 params,
+                                                 frame_cache=STATE["frame_cache"])
             _push(entry["shape"], entry["overlay"] + clusters,
                   entry["recipes"] + [{"face_ids": list(req.face_ids),
                                        "params": dict(req.params)}])
@@ -262,9 +265,12 @@ def _union_shells():
         try:
             fine = []
             for rec in entry["recipes"]:
+                # same frame cache as the interactive applies, so projected
+                # exports rebuild on the identical lattice
                 s, _ = build_rib_meshes(entry["shape"], rec["face_ids"],
                                         RibParams.from_dict(rec["params"]),
-                                        quality=3.0)
+                                        quality=3.0,
+                                        frame_cache=STATE["frame_cache"])
                 fine += s
             solids = fine
         except Exception:

@@ -175,7 +175,8 @@ $('btn-grow').addEventListener('click', async () => {
     const r = await fetch('/api/grow', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ face_ids }),
+      body: JSON.stringify({ face_ids,
+                             angle_deg: Number($('grow-angle').value) || 20 }),
     });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const data = await r.json();

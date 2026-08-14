@@ -68,6 +68,25 @@ def test_bad_params(box_step):
     assert r.status_code == 400
 
 
+def test_grow_angle_param(box_step):
+    c = TestClient(app)
+    d0 = _load(c, box_step)
+    seed = d0["faces"][0]["id"]
+    absent = c.post("/api/grow", json={"face_ids": [seed]})
+    assert absent.status_code == 200
+    explicit = c.post("/api/grow", json={"face_ids": [seed], "angle_deg": 20})
+    assert explicit.status_code == 200
+    # absent = legacy default (20 deg)
+    assert absent.json()["face_ids"] == explicit.json()["face_ids"]
+    # out-of-range angles clamp to [5, 60]: 200 deg would flood across the
+    # box's 90-deg creases, clamped to 60 it must stay on the seed face
+    wild = c.post("/api/grow", json={"face_ids": [seed], "angle_deg": 200})
+    assert wild.status_code == 200
+    sixty = c.post("/api/grow", json={"face_ids": [seed], "angle_deg": 60})
+    assert wild.json()["face_ids"] == sixty.json()["face_ids"]
+    assert len(wild.json()["face_ids"]) == 1
+
+
 def test_no_model():
     c = TestClient(app)
     from server.main import STATE

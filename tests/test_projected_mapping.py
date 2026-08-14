@@ -55,6 +55,26 @@ def _rib_xs_at(clusters, y_probe, z_min):
     return np.sort(np.asarray(xs))
 
 
+def _centers(a):
+    """Cluster raw vertex x's into rib centers."""
+    cs, cur = [], [a[0]]
+    for x in a[1:]:
+        if x - cur[-1] > 2.0:
+            cs.append(np.mean(cur)); cur = []
+        cur.append(x)
+    cs.append(np.mean(cur))
+    return np.asarray(cs)
+
+
+def _assert_one_grid(cl, cr, spacing):
+    # for every rib on side A there is a rib on side B whose x differs by
+    # an integer multiple of spacing (+-0.05 periods)
+    for x in cl:
+        k = (cr - x) / spacing
+        assert (np.abs(k - np.round(k)) < 0.05).any(), \
+            f"left rib at x={x:.2f} has no phase-aligned right rib (right={cr})"
+
+
 def test_projected_phase_continuous_across_groove(groove_box_step):
     s = load_step(groove_box_step)
     panels = _top_panel_faces(s)
@@ -72,20 +92,7 @@ def test_projected_phase_continuous_across_groove(groove_box_step):
     left = xs[xs < 30.0]
     right = xs[xs > 34.0]
     assert len(left) and len(right)
-    # cluster raw vertex x's into rib centers
-    def centers(a):
-        cs, cur = [], [a[0]]
-        for x in a[1:]:
-            if x - cur[-1] > 2.0:
-                cs.append(np.mean(cur)); cur = []
-            cur.append(x)
-        cs.append(np.mean(cur))
-        return np.asarray(cs)
-    cl, cr = centers(left), centers(right)
-    for x in cl:
-        k = (cr - x) / 8.0
-        assert (np.abs(k - np.round(k)) < 0.05).any(), \
-            f"left rib at x={x:.2f} has no phase-aligned right rib (right={cr})"
+    _assert_one_grid(_centers(left), _centers(right), 8.0)
 
 
 def test_projected_mapping_on_curved(cyl_patch_step):
@@ -101,6 +108,72 @@ def test_projected_mapping_on_curved(cyl_patch_step):
         man = m3d.Manifold(m3d.Mesh(np.ascontiguousarray(v, np.float32),
                                     np.ascontiguousarray(t, np.uint32)))
         assert not man.is_empty()
+
+
+def test_projected_bridges_hairline_groove(groove_box_step):
+    # the 4mm groove projects to a slit that splits the kept domain and
+    # margin carves a bare channel along it; morphological closing must
+    # seal it so ribs CROSS the groove in one welded, watertight cluster
+    # (points over the sealed strip clamp onto the flanks — the bridge)
+    from tests.test_boundary_robust import _watertight
+    s = load_step(groove_box_step)
+    panels = _top_panel_faces(s)
+    p = RibParams(pattern="rectangular", spacing=8, spacing_y=0,
+                  thickness=1.6, height=3, margin=1, taper_len=0,
+                  mapping="project")
+    clusters, reports = build_rib_meshes(s, panels, p)
+    lofted = sum(r.lofted for r in reports)
+    segments = sum(r.segments for r in reports)
+    assert segments and lofted / segments > 0.9
+    bridging = False
+    for v, t in clusters:
+        if not ((v[:, 0] < 29.0).any() and (v[:, 0] > 35.0).any()):
+            continue                   # cluster does not reach both flanks
+        span = ((v[t, 0].min(axis=1) < 30.2) & (v[t, 0].max(axis=1) > 33.8)
+                & (v[t, 2].min(axis=1) > 3.0))
+        bridging = bridging or bool(span.any())
+    assert bridging, "no rib crosses the groove"
+    assert all(_watertight(v, t) for v, t in clusters)
+
+
+def test_frame_cache_aligns_separate_applies(groove_box_step):
+    # the real workflow is one apply per panel: a shared frame_cache must
+    # land both on ONE global lattice even though the panels' own PCA axes
+    # differ (30x40 vs 46x40 swaps the in-plane principal directions)
+    from server.geometry.meshing import mesh_shape
+    s = load_step(groove_box_step)
+    panels = _top_panel_faces(s)
+    cx = {m.face_id: float(m.vertices[:, 0].mean())
+          for m in mesh_shape(s) if m.face_id in panels}
+    left_id = min(panels, key=lambda f: cx[f])
+    right_id = max(panels, key=lambda f: cx[f])
+    p = RibParams(pattern="rectangular", spacing=8, spacing_y=0,
+                  thickness=1.6, height=3, margin=1, taper_len=0,
+                  mapping="project")
+    cache = {}
+    ca, _ = build_rib_meshes(s, [left_id], p, frame_cache=cache)
+    cb, _ = build_rib_meshes(s, [right_id], p, frame_cache=cache)
+    xs = _rib_xs_at(ca + cb, 20.0, 10.5)
+    assert len(xs) > 4
+    left = xs[xs < 30.0]
+    right = xs[xs > 34.0]
+    assert len(left) and len(right)
+    _assert_one_grid(_centers(left), _centers(right), 8.0)
+
+
+def test_projected_band_clusters_outward(cruscotto_full_path):
+    # a dim-rendered half band = flipped shading normals = inward winding:
+    # every cluster mesh must enclose POSITIVE signed volume
+    p = RibParams(pattern="isogrid", spacing=12, thickness=1.2, height=1.5,
+                  margin=2, taper_len=10, mapping="project")
+    s = load_step(cruscotto_full_path)
+    clusters, reports = build_rib_meshes(s, [519, 580], p)
+    assert sum(r.lofted for r in reports) > 500
+    vols = [np.einsum("ij,ij->i", v[t[:, 0]],
+                      np.cross(v[t[:, 1]], v[t[:, 2]])).sum() / 6.0
+            for v, t in clusters]
+    bad = [f"{x:.1f}" for x in vols if x <= 0]
+    assert not bad, f"inward-wound clusters (signed volume <= 0): {bad}"
 
 
 def test_unfold_remains_default(box_step):

@@ -127,6 +127,7 @@ class _RegionMapper:
         e1 = flat[t[:, 1]] - flat[t[:, 0]]
         e2 = flat[t[:, 2]] - flat[t[:, 0]]
         signed = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        self.projected = min_cos is not None
         if min_cos is None:
             self.valid_idx = np.nonzero(signed > 1e-12)[0]
         else:
@@ -502,7 +503,12 @@ def _map_points(mapper, pts2d, offsets, max_snap=0.5):
         far = _shp.points(pts2d[mapper.last_snap > max_snap])
         bad = _shp.contains(domain, far) & (
             _shp.distance(far, domain.boundary) >= 0.05)
-        if bad.any():
+        # projected mode: interior far points can only sit over CLOSED
+        # hairline slits (the domain is kept triangles plus sealing) —
+        # clamping them onto the flanks IS the bridge. The fold-zone fatal
+        # test below is an unfold pathology guard; in projection the steep
+        # walls it would flag legitimately shadow those very slits.
+        if bad.any() and not getattr(mapper, "projected", False):
             flip = np.setdiff1d(np.arange(len(mapper.triangles)),
                                 mapper.valid_idx)
             folded = np.zeros(len(far), bool)
@@ -845,7 +851,30 @@ def _lattice_window(params, bounds):
     return (-hx, -hy, hx, hy)
 
 
-def _kept_domain(flat, triangles, valid_idx):
+def _merge_regions(regions):
+    """One synthetic region spanning all regions (projected mode only).
+
+    Disjoint panels — e.g. either side of an unselected separator strip —
+    must share one kept-domain so slit closing and clustering can bridge
+    them. Concatenation is safe here: projected mapping never flattens,
+    and the mapper reads only per-triangle data.
+    """
+    from dataclasses import replace
+    vs, ts, tf, wu, fids, off = [], [], [], [], [], 0
+    for r in regions:
+        vs.append(r.vertices)
+        ts.append(np.asarray(r.triangles, np.int64) + off)
+        tf.append(r.tri_face)
+        wu.append(r.wedge_uvs)
+        fids += list(r.face_ids)
+        off += len(r.vertices)
+    return replace(regions[0], face_ids=fids, vertices=np.vstack(vs),
+                   triangles=np.vstack(ts).astype(np.int32),
+                   tri_face=np.concatenate(tf), wedge_uvs=np.vstack(wu),
+                   all_planar=all(r.all_planar for r in regions))
+
+
+def _kept_domain(flat, triangles, valid_idx, params):
     """Projected clip boundary: union of the front-facing triangles only.
 
     Steep walls and undercuts are no rib territory, and without them the
@@ -858,17 +887,33 @@ def _kept_domain(flat, triangles, valid_idx):
         return None
     tri = np.concatenate([tri, tri[:, :1]], axis=1)   # close the rings
     geom = shapely.union_all(shapely.polygons(tri))
-    if geom is not None and not geom.is_valid:
+    if geom is None or geom.is_empty:
+        return geom
+    if not geom.is_valid:
         geom = geom.buffer(0)
+    # morphological closing: hairline slits (unselected separator strips,
+    # step walls compressed flat by the projection) would split the domain
+    # and put margin on both flanks — a bare channel exactly where the user
+    # wants continuity. Gaps under ~2c seal; ribs over sealed strips clamp
+    # onto the flanks (a small jog bridging the step). c is capped at
+    # spacing/3 so genuine openings (vents run 60-90mm) and whole pattern
+    # cells never seal shut.
+    c = min(max(2.0, 1.5 * params.thickness), params.spacing / 3.0)
+    if c > 0:
+        geom = geom.buffer(c, join_style=2).buffer(-c, join_style=2)
+        if not geom.is_valid:
+            geom = geom.buffer(0)
     return geom
 
 
-def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
+def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0,
+                     frame_cache=None):
     """Fast-engine rib builder: watertight cluster meshes, junction-free.
 
     Merges crossing capsule footprints in 2D per region, builds each
     connected cluster as one triangle mesh (no OCCT solids, no booleans).
-    Returns (clusters:[(verts, tris)], reports).
+    frame_cache (a dict) makes separate projected applies on the same front
+    share one lattice frame. Returns (clusters:[(verts, tris)], reports).
     """
     from shapely.geometry import Polygon as ShpPolygon
     from shapely.ops import unary_union
@@ -882,7 +927,22 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
         raise RibbingError("selected faces could not be triangulated")
     project = params.mapping == "project"
     if project:
+        if len(regions) > 1:
+            # disjoint panels must land in ONE domain so hairline slits
+            # between them can seal and clusters can bridge them
+            regions = [_merge_regions(regions)]
         p_ctr, p_axes = _projection_frame(regions)
+        if frame_cache is not None:
+            held = frame_cache.get("frame")
+            if held is not None and (
+                    np.cross(held[1][:, 0], held[1][:, 1])
+                    @ np.cross(p_axes[:, 0], p_axes[:, 1])
+                    >= math.cos(math.radians(25.0))):
+                # same front view as an earlier apply: reuse its frame
+                # verbatim so every apply lands on one global lattice
+                p_ctr, p_axes = held
+            else:
+                frame_cache["frame"] = (p_ctr, p_axes)
     clusters, reports = [], []
     for region in regions:
         rep = RibReport(face_id=region.face_ids[0], face_ids=region.face_ids)
@@ -896,7 +956,8 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                 map_tris = region.triangles
                 mapper = _RegionMapper(region, flat, shape,
                                        triangles=map_tris, min_cos=0.30)
-                boundary = _kept_domain(flat, map_tris, mapper.valid_idx)
+                boundary = _kept_domain(flat, map_tris, mapper.valid_idx,
+                                        params)
                 if boundary is None or boundary.is_empty:
                     rep.warnings.append(
                         "region is edge-on to the projection plane")

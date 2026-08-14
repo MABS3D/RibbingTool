@@ -27,9 +27,12 @@ export function initViewer(container) {
   controls.enableDamping = true;
 
   scene.add(new THREE.HemisphereLight(0xf4f6ff, 0x33363d, 1.0));
+  // key light rides the camera: thin rib walls face every which way, and a
+  // world-fixed key leaves whole flanks in the dark at grazing view angles
   const key = new THREE.DirectionalLight(0xffffff, 1.6);
-  key.position.set(1, 2, 1.5);
-  scene.add(key);
+  key.position.set(0.6, 1.2, 1.0);
+  camera.add(key);
+  scene.add(camera);
   const fill = new THREE.DirectionalLight(0xb8c4ff, 0.5);
   fill.position.set(-1.5, -1, -1);
   scene.add(fill);
