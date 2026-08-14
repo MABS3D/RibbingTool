@@ -62,13 +62,50 @@ def _flat_boundary(triangles, flat):
     return poly
 
 
+def _flatten_with_cuts(region):
+    """Flatten a region, cutting non-disk topology open when needed.
+
+    Returns (flat_coords, triangles_for_lookup): the triangle array matches
+    region.tri_face / region.wedge_uvs by index in both cases (igl.cut_mesh
+    preserves triangle order, only duplicating vertices along cuts).
+    """
+    from dataclasses import replace
+    try:
+        return flatten(region), region.triangles
+    except FlattenError:
+        pass
+    import igl
+    f = np.ascontiguousarray(region.triangles, np.int64)
+    try:
+        paths = igl.cut_to_disk(f)
+    except Exception:
+        paths = []
+    if not paths:
+        raise FlattenError("region cannot be flattened (non-disk topology)")
+    cut_edges = set()
+    for path in paths:
+        for a, b in zip(path[:-1], path[1:]):
+            cut_edges.add((min(a, b), max(a, b)))
+    flags = np.zeros(f.shape, dtype=np.int64)
+    for k, t in enumerate(f):
+        for e, (a, b) in enumerate(((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))):
+            if (min(a, b), max(a, b)) in cut_edges:
+                flags[k, e] = 1
+    vcut, fcut = igl.cut_mesh(
+        np.ascontiguousarray(region.vertices, np.float64), f, flags)
+    shadow = replace(region, vertices=vcut,
+                     triangles=np.asarray(fcut, np.int32))
+    return flatten(shadow), shadow.triangles
+
+
 class _RegionMapper:
     """Maps flattened 2D points back onto the true (multi-face) surface."""
 
-    def __init__(self, region, flat, body):
+    def __init__(self, region, flat, body, triangles=None):
         self.region = region
         self.flat = flat
-        self.tri_polys = [Polygon(flat[t]) for t in region.triangles]
+        self.triangles = region.triangles if triangles is None else triangles
+        self.tri_polys = [Polygon(flat[t]) for t in self.triangles]
         self.tree = STRtree(self.tri_polys)
         self.props = {}
         self.sign = {}
@@ -121,7 +158,7 @@ class _RegionMapper:
                 m = missing[p]
                 if tri_idx[m] < 0:
                     tri_idx[m] = t
-        tris = self.region.triangles[tri_idx]
+        tris = self.triangles[tri_idx]
         a, b, c = (self.flat[tris[:, i]] for i in range(3))
         v0, v1, v2 = b - a, c - a, pts - a
         d00 = np.einsum("ij,ij->i", v0, v0)
@@ -248,8 +285,8 @@ def _sew_rib(bottom, top):
 
 
 def _region_ribs(shape, region, params, rep, stagger):
-    flat = flatten(region)
-    boundary = _flat_boundary(region.triangles, flat)
+    flat, map_tris = _flatten_with_cuts(region)
+    boundary = _flat_boundary(map_tris, flat)
     lines = clip_and_border(generate_segments(params, boundary.bounds),
                             boundary, params)
     subsegs = []
@@ -267,7 +304,7 @@ def _region_ribs(shape, region, params, rep, stagger):
             " — increase spacing or lower density")
     rep.segments = len(subsegs)
 
-    mapper = _RegionMapper(region, flat, shape)
+    mapper = _RegionMapper(region, flat, shape, triangles=map_tris)
     w_bot = params.thickness / 2.0
     w_top = max(w_bot - params.height * math.tan(math.radians(params.draft_deg)),
                 w_bot * 0.05, 1e-3)

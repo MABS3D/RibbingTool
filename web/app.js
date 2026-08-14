@@ -163,6 +163,28 @@ window.__faces = () => listFaces();
 window.__lookAt = (id) => lookAtFace(id);
 window.__snap = (w) => snapshot(w);
 
+$('btn-grow').addEventListener('click', async () => {
+  const face_ids = getSelection();
+  if (!face_ids.length) return;
+  setBusy(true, 'growing selection...');
+  try {
+    const r = await fetch('/api/grow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ face_ids }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+    setSelection(data.face_ids);
+    note('ok', `selection grown to ${data.face_ids.length} tangent-connected face(s)`);
+  } catch (err) {
+    note('err', 'grow failed: ' + err.message);
+  } finally {
+    setBusy(false);
+    refreshButtons();
+  }
+});
+
 $('btn-clear').addEventListener('click', () => clearSelection());
 $('btn-step').addEventListener('click', () => { window.location = '/api/export/step'; });
 $('btn-stl').addEventListener('click', () => { window.location = '/api/export/stl'; });

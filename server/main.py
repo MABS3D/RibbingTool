@@ -45,6 +45,11 @@ class LoadPathRequest(BaseModel):
     path: str
 
 
+class GrowRequest(BaseModel):
+    face_ids: list[int]
+    angle_deg: float = 20.0
+
+
 def _entry():
     return STATE["stack"][-1]
 
@@ -136,6 +141,21 @@ def api_load_path(req: LoadPathRequest):
     except StepError as e:
         raise HTTPException(400, str(e))
     return _load_shape(shape, Path(req.path).name)
+
+
+@app.post("/api/grow")
+def api_grow(req: GrowRequest):
+    if not STATE["stack"]:
+        raise HTTPException(400, "no model loaded")
+    if not req.face_ids:
+        raise HTTPException(400, "no faces selected")
+    from .geometry.selection import grow_tangent
+    try:
+        grown = grow_tangent(_entry()["shape"], req.face_ids,
+                             angle_deg=req.angle_deg)
+    except Exception as e:
+        raise HTTPException(400, f"selection growth failed: {e}")
+    return {"face_ids": grown}
 
 
 @app.post("/api/ribs")

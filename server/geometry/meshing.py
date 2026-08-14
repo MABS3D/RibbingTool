@@ -99,16 +99,67 @@ class RegionMesh:
     all_planar: bool
 
 
+def _edge_node_pairs(shape, selected_faces):
+    """Global-index vertex pairs to weld, from shared-edge node polygons.
+
+    Uses OCCT's per-edge PolygonOnTriangulation so welding is exact and a
+    face's own seam edges are never welded shut (a full cylinder must stay
+    an unrolled sheet).
+    """
+    from OCP.TopExp import TopExp, TopExp_Explorer
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+
+    emap = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, emap)
+
+    def polygon_nodes(edge, face_entry):
+        face, offset = face_entry
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        poly = BRep_Tool.PolygonOnTriangulation_s(edge, tri, loc)
+        if poly is None:
+            return None
+        nodes = poly.Nodes()
+        return [nodes.Value(i) - 1 + offset
+                for i in range(nodes.Lower(), nodes.Upper() + 1)]
+
+    pairs = []
+    for idx in range(1, emap.Extent() + 1):
+        edge = TopoDS.Edge_s(emap.FindKey(idx))
+        adj = []
+        for fshape in emap.FindFromIndex(idx):
+            fid = None
+            for cand_fid, entry in selected_faces.items():
+                if entry[0].IsSame(fshape):
+                    fid = cand_fid
+                    break
+            if fid is not None:
+                adj.append(fid)
+        adj = sorted(set(adj))
+        if len(adj) < 2:
+            continue
+        base = polygon_nodes(edge, selected_faces[adj[0]])
+        if not base:
+            continue
+        for other_fid in adj[1:]:
+            nodes = polygon_nodes(edge, selected_faces[other_fid])
+            if not nodes or len(nodes) != len(base):
+                continue
+            pairs += list(zip(base, nodes))
+    return pairs
+
+
 def region_meshes(shape, face_ids, lin_defl=0.4, ang_defl=0.3):
     """Weld the selected faces' meshes and split into connected regions.
 
-    OCCT discretizes shared edges once, so boundary nodes of adjacent faces
-    coincide exactly and welding by rounded coordinates is reliable.
+    Welding follows OCCT's shared-edge node polygons (exact, seam-safe).
     """
     from .step_io import StepError
     BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
     fm = face_map(shape)
-    metas = []
+    metas, selected_faces = [], {}
+    off = 0
     for fid in face_ids:
         if not 1 <= fid <= fm.Size():
             raise StepError(f"face id {fid} out of range 1..{fm.Size()}")
@@ -116,16 +167,34 @@ def region_meshes(shape, face_ids, lin_defl=0.4, ang_defl=0.3):
         m = face_mesh(face, fid)
         if m is not None and len(m.triangles):
             metas.append(m)
+            selected_faces[fid] = (face, off)
+            off += len(m.vertices)
     if not metas:
         return []
 
     allv = np.vstack([m.vertices for m in metas])
-    key = np.round(allv / 1e-5).astype(np.int64)
-    _, uniq_idx, inverse = np.unique(key, axis=0, return_index=True,
-                                     return_inverse=True)
-    verts = allv[uniq_idx]
+    n_all = len(allv)
 
-    tris, tri_face, wedge, owners = [], [], [], []
+    # union-find weld over exact shared-edge node pairs
+    parent = np.arange(n_all)
+
+    def vfind(a):
+        root = a
+        while parent[root] != root:
+            root = parent[root]
+        while parent[a] != root:
+            parent[a], a = root, parent[a]
+        return root
+
+    for a, b in _edge_node_pairs(shape, selected_faces):
+        ra, rb = vfind(a), vfind(b)
+        if ra != rb:
+            parent[ra] = rb
+    roots = np.array([vfind(i) for i in range(n_all)])
+    uniq_roots, inverse = np.unique(roots, return_inverse=True)
+    verts = allv[uniq_roots]
+
+    tris, tri_face, wedge = [], [], []
     off = 0
     for m in metas:
         t = inverse[m.triangles + off]

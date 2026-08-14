@@ -55,6 +55,17 @@ def test_region_pattern_crosses_face_boundary(cyl_patch_step):
     assert all(shape_volume(x) > 0 for x in solids[:5])
 
 
+def test_full_cylinder_region_keeps_seam(full_cyl_step):
+    # welding must not close the parametric seam: the lateral face of a full
+    # cylinder still unrolls and takes ribs through the region path
+    s = load_step(full_cyl_step)
+    from server.geometry.meshing import mesh_shape as _ms
+    cyl = next(m.face_id for m in _ms(s) if m.surface_kind == "cylinder")
+    solids, reports = build_rib_solids(
+        s, [cyl], RibParams(pattern="rectangular", spacing=15, height=2.5))
+    assert reports[0].lofted > 5
+
+
 def test_flatten_orientation_stable(box_step):
     # same face flattened twice gives identical coords (PCA-aligned)
     from server.geometry.flatten import flatten
