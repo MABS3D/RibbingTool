@@ -28,6 +28,15 @@ from .geometry.step_io import (
 )
 
 app = FastAPI(title="RibbingTool")
+
+
+@app.middleware("http")
+async def _no_stale_statics(request, call_next):
+    # a stale cached app.js/viewer.js silently ignores new features
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/web"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 WEB = Path(__file__).resolve().parents[1] / "web"
 
 # Stack of model states. Each entry:
@@ -105,14 +114,15 @@ def _mesh_payload():
     }
 
 
-def _push(shape, overlay):
-    STATE["stack"].append({"shape": shape, "overlay": overlay})
+def _push(shape, overlay, recipes):
+    STATE["stack"].append({"shape": shape, "overlay": overlay,
+                           "recipes": recipes})
     if len(STATE["stack"]) > 10:
         STATE["stack"] = STATE["stack"][:1] + STATE["stack"][-9:]
 
 
 def _load_shape(shape, filename):
-    STATE["stack"] = [{"shape": shape, "overlay": []}]
+    STATE["stack"] = [{"shape": shape, "overlay": [], "recipes": []}]
     STATE["filename"] = filename
     return _mesh_payload()
 
@@ -179,9 +189,11 @@ def api_ribs(req: RibsRequest):
                                            stagger=(engine == "exact"))
         if engine == "exact":
             welded = fuse_into(entry["shape"], entry["overlay"] + solids, reports)
-            _push(welded, [])
+            _push(welded, [], [])
         else:
-            _push(entry["shape"], entry["overlay"] + solids)
+            _push(entry["shape"], entry["overlay"] + solids,
+                  entry["recipes"] + [{"face_ids": list(req.face_ids),
+                                       "params": dict(req.params)}])
     except (RibbingError, FlattenError, BooleanError, StepError, ValueError) as e:
         raise HTTPException(400, str(e))
 
@@ -223,9 +235,29 @@ def _stl_bytes(v, t):
 
 
 def _union_shells():
-    """Body + overlay unioned in mesh space (fine tessellation for export)."""
+    """Body + ribs unioned in mesh space at export quality.
+
+    Ribs are rebuilt from their recipes at high sampling quality so facets
+    drop below print resolution; the interactive overlay stays coarser.
+    """
     entry = _entry()
-    return mesh_union(entry["shape"], entry["overlay"], lin_defl=0.2)
+    if "fine_shells" in entry:
+        return entry["fine_shells"]
+    solids = entry["overlay"]
+    if entry.get("recipes"):
+        try:
+            fine = []
+            for rec in entry["recipes"]:
+                s, _ = build_rib_solids(entry["shape"], rec["face_ids"],
+                                        RibParams.from_dict(rec["params"]),
+                                        quality=3.0)
+                fine += s
+            solids = fine
+        except Exception:
+            pass  # fall back to the interactive-quality overlay solids
+    shells = mesh_union(entry["shape"], solids, lin_defl=0.2)
+    entry["fine_shells"] = shells
+    return shells
 
 
 def _concat_shells(shells):

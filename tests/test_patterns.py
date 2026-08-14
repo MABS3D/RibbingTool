@@ -72,6 +72,20 @@ def test_capsule_shape():
     assert np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y) > 0
 
 
+def test_capsule_cap_triangulation_covers_footprint():
+    from server.geometry.patterns import capsule_cap_triangles
+    pts, ns = capsule((0, 0), (30, 0), 1.0, return_meta=True)
+    tris = capsule_cap_triangles(len(pts), ns, 5)
+    assert len(tris) == len(pts) - 2          # proper simple-polygon count
+    area = 0.0
+    for a, b, c in tris:
+        v1, v2 = pts[b] - pts[a], pts[c] - pts[a]
+        signed = 0.5 * (v1[0] * v2[1] - v1[1] * v2[0])
+        assert signed > 0                     # consistently CCW, no flips
+        area += signed
+    assert area == pytest.approx(Polygon(pts).area, rel=1e-6)
+
+
 def test_from_dict_ignores_unknown():
     p = RibParams.from_dict({"pattern": "hexagonal", "spacing": 9, "bogus": 1})
     assert p.pattern == "hexagonal" and p.spacing == 9

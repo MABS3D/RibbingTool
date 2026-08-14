@@ -189,11 +189,14 @@ def clip_and_border(segments, boundary, params):
     return out
 
 
-def capsule(p0, p1, half_width, step=2.5, cap_pts=5):
+def capsule(p0, p1, half_width, step=2.5, cap_pts=5, return_meta=False):
     """Closed CCW stadium loop around segment p0-p1 (last point not repeated).
 
     Same segment + step => same point count for any half_width, so a
     narrower top loop pairs 1:1 with its bottom loop for ruled lofting.
+    With return_meta=True, returns (points, ns) where ns is the per-side
+    sample count (index layout: side1[0:ns], cap1[ns:ns+cap_pts],
+    side2[...ns], cap0[...cap_pts]).
     """
     p0 = np.asarray(p0, float)
     p1 = np.asarray(p1, float)
@@ -213,4 +216,31 @@ def capsule(p0, p1, half_width, step=2.5, cap_pts=5):
     ang = np.linspace(90, 270, cap_pts + 2)[1:-1]
     pts += [p0 + w * (math.cos(math.radians(a)) * d
                       + math.sin(math.radians(a)) * n) for a in ang]   # cap at p0
-    return np.array(pts)
+    arr = np.array(pts)
+    return (arr, ns) if return_meta else arr
+
+
+def capsule_cap_triangles(n_total, ns, cap_pts):
+    """Triangulate a capsule footprint: ladder quads across the width.
+
+    Fanning caps from one end vertex slices chords through a rib that bends
+    along its length — every curved rib's top looks crumpled. Ladder
+    triangles only ever span the rib WIDTH; the rounded ends get tiny fans.
+    Returns CCW (facing +normal) index triples into the loop.
+    """
+    tris = []
+    opp = lambda i: ns + cap_pts + (ns - 1 - i)
+    for i in range(ns - 1):
+        a, b = i, i + 1
+        a2, b2 = opp(i), opp(i + 1)
+        tris.append((a, b, b2))
+        tris.append((a, b2, a2))
+    # cap at p1: fan from side1 end across the arc to side2 start
+    s1e = ns - 1
+    for k in range(ns, ns + cap_pts):
+        tris.append((s1e, k, k + 1))
+    # cap at p0: fan from side2 end across the arc, wrapping to side1 start
+    s2e = ns + cap_pts + ns - 1
+    for k in range(s2e + 1, n_total):
+        tris.append((s2e, k, (k + 1) % n_total))
+    return tris

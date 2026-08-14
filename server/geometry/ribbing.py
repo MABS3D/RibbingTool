@@ -17,7 +17,12 @@ from OCP.gp import gp_Pnt
 from .booleans import BooleanError, _fuse_args, mesh_fallback_fuse
 from .flatten import FlattenError, boundary_loops, flatten
 from .meshing import region_meshes
-from .patterns import capsule, clip_and_border, generate_segments
+from .patterns import (
+    capsule,
+    capsule_cap_triangles,
+    clip_and_border,
+    generate_segments,
+)
 from .step_io import get_face, shape_volume
 
 
@@ -313,12 +318,14 @@ def _loft(bottom, top):
     return ts.Shape()
 
 
-def _sew_rib(bottom, top):
+def _sew_rib(bottom, top, cap_tris=None):
     """Closed triangulated solid between two same-count loops.
 
     ThruSections cannot cap non-planar loops (produces invalid solids that
     corrupt booleans), so on curved surfaces every rib facet is built as an
-    explicit planar triangle: side quads split in two, convex caps fanned.
+    explicit planar triangle. cap_tris (from capsule_cap_triangles) keeps
+    cap chords across the rib width; without it, caps fall back to an
+    end-vertex fan (fine only for near-planar loops).
     """
     from OCP.BRepBuilderAPI import (
         BRepBuilderAPI_MakeFace,
@@ -345,9 +352,11 @@ def _sew_rib(bottom, top):
         k2 = (k + 1) % K
         tri(bottom[k], bottom[k2], top[k2])
         tri(bottom[k], top[k2], top[k])
-    for k in range(1, K - 1):
-        tri(bottom[0], bottom[k + 1], bottom[k])
-        tri(top[0], top[k], top[k + 1])
+    if cap_tris is None:
+        cap_tris = [(0, k, k + 1) for k in range(1, K - 1)]
+    for a, b, c in cap_tris:
+        tri(top[a], top[b], top[c])            # top faces up
+        tri(bottom[a], bottom[c], bottom[b])   # bottom faces down
     sew.Perform()
     ex = TopExp_Explorer(sew.SewedShape(), TopAbs_SHELL)
     if not ex.More():
@@ -360,7 +369,7 @@ def _sew_rib(bottom, top):
     return solid
 
 
-def _region_ribs(shape, region, params, rep, stagger):
+def _region_ribs(shape, region, params, rep, stagger, quality=1.0):
     flat, map_tris = _flatten_with_cuts(region)
     boundary = _flat_boundary(map_tris, flat)
     lines = clip_and_border(generate_segments(params, boundary.bounds),
@@ -384,7 +393,8 @@ def _region_ribs(shape, region, params, rep, stagger):
     w_bot = params.thickness / 2.0
     w_top = max(w_bot - params.height * math.tan(math.radians(params.draft_deg)),
                 w_bot * 0.05, 1e-3)
-    step = float(np.clip(params.spacing / 5.0, 0.8, 2.0))
+    step = float(np.clip(params.spacing / 6.0, 0.7, 1.5)) / max(quality, 0.1)
+    cap_pts = 5 if quality <= 1.0 else 11
     build = _loft if region.all_planar else _sew_rib
 
     # run-out tapering: with no border rib, rib height ramps to ~0 towards
@@ -414,16 +424,22 @@ def _region_ribs(shape, region, params, rep, stagger):
         else:
             d_embed, d_height = params.embed, params.height
         try:
-            bot3 = mapper.map_loop(capsule(p0, p1, w_bot, step=step), -d_embed)
-            top2 = capsule(p0, p1, w_top, step=step)
+            bot2, ns = capsule(p0, p1, w_bot, step=step, cap_pts=cap_pts,
+                               return_meta=True)
+            bot3 = mapper.map_loop(bot2, -d_embed)
+            top2 = capsule(p0, p1, w_top, step=step, cap_pts=cap_pts)
             off = top_offsets(top2, d_height)
             top3 = mapper.map_loop(top2, off)
             if bot3 is None or top3 is None or _folded(bot3, top3):
                 rep.skipped += 1
                 continue
-            # tapered tops are non-planar: ThruSections cannot cap them
-            rib_build = _sew_rib if isinstance(off, np.ndarray) else build
-            solid = rib_build(bot3, top3)
+            if build is _loft and not isinstance(off, np.ndarray):
+                solid = _loft(bot3, top3)
+            else:
+                # tapered tops are non-planar (ThruSections cannot cap them);
+                # curved ribs need width-wise cap chords
+                cap_tris = capsule_cap_triangles(len(bot2), ns, cap_pts)
+                solid = _sew_rib(bot3, top3, cap_tris)
             if not BRepCheck_Analyzer(solid).IsValid():
                 rep.skipped += 1
                 continue
@@ -444,11 +460,13 @@ def _region_ribs(shape, region, params, rep, stagger):
     return solids
 
 
-def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False):
+def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False,
+                     quality=1.0):
     """Build rib solids for the selected faces without fusing.
 
     Connected faces are welded into regions that share one coherent flattened
-    pattern (ribs run continuously across face boundaries).
+    pattern (ribs run continuously across face boundaries). quality > 1
+    refines rib facet sampling (export-grade smoothness).
     Returns (solids, reports). Raises RibbingError if nothing could be built.
     """
     if not face_ids:
@@ -465,7 +483,8 @@ def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False):
         rep = RibReport(face_id=region.face_ids[0], face_ids=region.face_ids)
         reports.append(rep)
         try:
-            all_solids += _region_ribs(shape, region, params, rep, stagger)
+            all_solids += _region_ribs(shape, region, params, rep, stagger,
+                                       quality)
         except FlattenError as e:
             rep.warnings.append(str(e))
         except RibbingError:

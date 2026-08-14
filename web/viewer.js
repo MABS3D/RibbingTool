@@ -1,5 +1,6 @@
 import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
+import { mergeVertices, toCreasedNormals } from './vendor/BufferGeometryUtils.js';
 
 const BASE = new THREE.Color(0x8a8f98);
 const HOVER = new THREE.Color(0xaab2c0);
@@ -108,11 +109,18 @@ export function loadModel(data) {
   hovered = null;
 
   if (data.overlay) {
-    const geo = new THREE.BufferGeometry();
+    let geo = new THREE.BufferGeometry();
     geo.setAttribute('position',
       new THREE.Float32BufferAttribute(new Float32Array(data.overlay.positions), 3));
     geo.setIndex(new THREE.Uint32BufferAttribute(new Uint32Array(data.overlay.indices), 1));
-    geo.computeVertexNormals();
+    try {
+      // weld duplicated facet vertices, then smooth-shade across gentle
+      // facets while keeping true edges (rib walls vs tops) crisp
+      geo = mergeVertices(geo, 1e-4);
+      geo = toCreasedNormals(geo, THREE.MathUtils.degToRad(38));
+    } catch (e) {
+      geo.computeVertexNormals();
+    }
     const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
       color: RIB, metalness: 0.1, roughness: 0.62, side: THREE.DoubleSide,
     }));
@@ -177,7 +185,7 @@ export function snapshot(width = 640) {
   return c.toDataURL('image/jpeg', 0.78);
 }
 
-export function lookAtFace(faceId) {
+export function lookAtFace(faceId, zoom = 1.0) {
   const mesh = group.children.find((m) => m.userData.faceId === faceId);
   if (!mesh) return false;
   mesh.geometry.computeBoundingSphere();
@@ -189,7 +197,8 @@ export function lookAtFace(faceId) {
   n.normalize();
   if (n.lengthSq() < 0.5) n.set(0, 0, 1);
   controls.target.copy(bs.center);
-  camera.position.copy(bs.center).addScaledVector(n, Math.max(bs.radius * 2.6, 40));
+  camera.position.copy(bs.center)
+    .addScaledVector(n, Math.max(bs.radius * 2.6, 40) / zoom);
   controls.update();
   return true;
 }

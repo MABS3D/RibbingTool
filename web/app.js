@@ -161,7 +161,7 @@ window.__loadPath = async (path) => {
 window.__getSelection = () => getSelection();
 window.__setSelection = (ids) => setSelection(ids);
 window.__faces = () => listFaces();
-window.__lookAt = (id) => lookAtFace(id);
+window.__lookAt = (id, zoom) => lookAtFace(id, zoom);
 window.__snap = (w) => snapshot(w);
 
 $('btn-grow').addEventListener('click', async () => {
