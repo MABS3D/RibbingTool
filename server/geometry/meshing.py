@@ -99,7 +99,7 @@ class RegionMesh:
     all_planar: bool
 
 
-def _edge_node_pairs(shape, selected_faces):
+def _edge_node_pairs(shape, fm, selected_faces):
     """Global-index vertex pairs to weld, from shared-edge node polygons.
 
     Uses OCCT's per-edge PolygonOnTriangulation so welding is exact and a
@@ -129,23 +129,17 @@ def _edge_node_pairs(shape, selected_faces):
         edge = TopoDS.Edge_s(emap.FindKey(idx))
         adj = []
         for fshape in emap.FindFromIndex(idx):
-            fid = None
-            for cand_fid, entry in selected_faces.items():
-                if entry[0].IsSame(fshape):
-                    fid = cand_fid
-                    break
-            if fid is not None:
+            fid = fm.FindIndex(fshape)
+            if fid in selected_faces:
                 adj.append(fid)
         adj = sorted(set(adj))
-        if len(adj) < 2:
+        if len(adj) != 2:
+            # welding across 3+ faces at a junction edge would create a
+            # non-manifold mesh — leave such edges unwelded
             continue
         base = polygon_nodes(edge, selected_faces[adj[0]])
-        if not base:
-            continue
-        for other_fid in adj[1:]:
-            nodes = polygon_nodes(edge, selected_faces[other_fid])
-            if not nodes or len(nodes) != len(base):
-                continue
+        nodes = polygon_nodes(edge, selected_faces[adj[1]])
+        if base and nodes and len(nodes) == len(base):
             pairs += list(zip(base, nodes))
     return pairs
 
@@ -186,25 +180,65 @@ def region_meshes(shape, face_ids, lin_defl=0.4, ang_defl=0.3):
             parent[a], a = root, parent[a]
         return root
 
-    for a, b in _edge_node_pairs(shape, selected_faces):
+    for a, b in _edge_node_pairs(shape, fm, selected_faces):
         ra, rb = vfind(a), vfind(b)
         if ra != rb:
             parent[ra] = rb
-    roots = np.array([vfind(i) for i in range(n_all)])
-    uniq_roots, inverse = np.unique(roots, return_inverse=True)
-    verts = allv[uniq_roots]
 
-    tris, tri_face, wedge = [], [], []
-    off = 0
-    for m in metas:
-        t = inverse[m.triangles + off]
-        tris.append(t)
-        tri_face.append(np.full(len(t), m.face_id))
-        wedge.append(m.uvs[m.triangles])
-        off += len(m.vertices)
-    tris = np.vstack(tris)
-    tri_face = np.concatenate(tri_face)
-    wedge = np.vstack(wedge)
+    def _rebuild():
+        roots = np.array([vfind(i) for i in range(n_all)])
+        uniq_roots, inverse = np.unique(roots, return_inverse=True)
+        verts = allv[uniq_roots]
+        tris, tri_face, wedge = [], [], []
+        off = 0
+        for m in metas:
+            t = inverse[m.triangles + off]
+            tris.append(t)
+            tri_face.append(np.full(len(t), m.face_id))
+            wedge.append(m.uvs[m.triangles])
+            off += len(m.vertices)
+        return (verts, np.vstack(tris), np.concatenate(tri_face),
+                np.vstack(wedge))
+
+    verts, tris, tri_face, wedge = _rebuild()
+
+    # weld residual coincident duplicates that appear as zero-length triangle
+    # edges (defects, never seams) — they NaN the LSCM cotangents otherwise
+    for _ in range(3):
+        va = verts[tris]
+        zero_pairs = []
+        for i, j in ((0, 1), (1, 2), (2, 0)):
+            L = np.linalg.norm(va[:, i] - va[:, j], axis=1)
+            hit = (L < 1e-7) & (tris[:, i] != tris[:, j])
+            for k in np.nonzero(hit)[0]:
+                zero_pairs.append((tris[k, i], tris[k, j]))
+        if not zero_pairs:
+            break
+        root_of = {}
+        for gi in range(n_all):
+            root_of.setdefault(vfind(gi), []).append(gi)
+        # map merged-vertex index back to any global index and union
+        roots = np.array([vfind(i) for i in range(n_all)])
+        uniq_roots = np.unique(roots)
+        for a, b in zero_pairs:
+            ga = root_of[uniq_roots[a]][0]
+            gb = root_of[uniq_roots[b]][0]
+            ra, rb = vfind(ga), vfind(gb)
+            if ra != rb:
+                parent[ra] = rb
+        verts, tris, tri_face, wedge = _rebuild()
+
+    # drop true slivers (collinear, distinct vertices)
+    va = verts[tris]
+    areas = 0.5 * np.linalg.norm(
+        np.cross(va[:, 1] - va[:, 0], va[:, 2] - va[:, 0]), axis=1)
+    ok = ((areas > 1e-8)
+          & (tris[:, 0] != tris[:, 1])
+          & (tris[:, 1] != tris[:, 2])
+          & (tris[:, 0] != tris[:, 2]))
+    tris, tri_face, wedge = tris[ok], tri_face[ok], wedge[ok]
+    if not len(tris):
+        return []
 
     # connected components over shared welded edges
     edge_owner = {}

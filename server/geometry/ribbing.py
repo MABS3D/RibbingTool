@@ -2,9 +2,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-import shapely
 from shapely.geometry import Polygon
-from shapely.strtree import STRtree
 
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon
@@ -82,16 +80,27 @@ def _flatten_with_cuts(region):
         paths = []
     if not paths:
         raise FlattenError("region cannot be flattened (non-disk topology)")
+    # cut_to_disk's paths include existing boundary loops — only interior
+    # edges (two adjacent triangles) may be flagged for cutting
+    from collections import Counter
+    edge_count = Counter()
+    for t in f:
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_count[(min(a, b), max(a, b))] += 1
     cut_edges = set()
     for path in paths:
         for a, b in zip(path[:-1], path[1:]):
-            cut_edges.add((min(a, b), max(a, b)))
-    flags = np.zeros(f.shape, dtype=np.int64)
+            e = (min(a, b), max(a, b))
+            if edge_count.get(e, 0) == 2:
+                cut_edges.add(e)
+    if not cut_edges:
+        raise FlattenError("region cannot be flattened (non-disk topology)")
+    flags = np.zeros(f.shape, dtype=bool)
     for k, t in enumerate(f):
         for e, (a, b) in enumerate(((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))):
             if (min(a, b), max(a, b)) in cut_edges:
-                flags[k, e] = 1
-    vcut, fcut = igl.cut_mesh(
+                flags[k, e] = True
+    vcut, fcut, _ = igl.cut_mesh(
         np.ascontiguousarray(region.vertices, np.float64), f, flags)
     shadow = replace(region, vertices=vcut,
                      triangles=np.asarray(fcut, np.int32))
@@ -102,11 +111,11 @@ class _RegionMapper:
     """Maps flattened 2D points back onto the true (multi-face) surface."""
 
     def __init__(self, region, flat, body, triangles=None):
+        from shapely.strtree import STRtree
         self.region = region
         self.flat = flat
         self.triangles = region.triangles if triangles is None else triangles
-        self.tri_polys = [Polygon(flat[t]) for t in self.triangles]
-        self.tree = STRtree(self.tri_polys)
+        self.tree = STRtree([Polygon(flat[t]) for t in self.triangles])
         self.props = {}
         self.sign = {}
         self.curv = {}
@@ -131,7 +140,10 @@ class _RegionMapper:
         return np.array([p.X(), p.Y(), p.Z()]), nv
 
     def _calibrate(self, body):
-        areas = np.array([p.area for p in self.tri_polys])
+        t = self.triangles
+        e1 = self.flat[t[:, 1]] - self.flat[t[:, 0]]
+        e2 = self.flat[t[:, 2]] - self.flat[t[:, 0]]
+        areas = np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0])
         k = int(np.argmax(areas))
         fid = int(self.region.tri_face[k])
         uv = self.region.wedge_uvs[k].mean(axis=0)
@@ -144,6 +156,7 @@ class _RegionMapper:
             self.flip = -1.0
 
     def _locate(self, pts):
+        import shapely
         k = len(pts)
         geoms = shapely.points(pts)
         tri_idx = np.full(k, -1, dtype=np.int64)
@@ -355,6 +368,10 @@ def build_rib_solids(shape, face_ids, params, lin_defl=0.4, stagger=False):
     """
     if not face_ids:
         raise RibbingError("no faces selected")
+    if len(face_ids) > 25:
+        # many-face regions: coarser mapping mesh keeps memory in check
+        # (surface evaluation stays exact through UVs regardless)
+        lin_defl = max(lin_defl, 0.7)
     regions = region_meshes(shape, face_ids, lin_defl)
     if not regions:
         raise RibbingError("selected faces could not be triangulated")

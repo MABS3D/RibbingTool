@@ -34,11 +34,38 @@ def _face_normal_at(face, point):
     return v
 
 
-def grow_tangent(shape, seed_ids, angle_deg=20.0, max_faces=300):
+def _face_min_radius(face, samples=3):
+    """Smallest principal curvature radius over a few UV samples (inf=flat)."""
+    from OCP.BRepLProp import BRepLProp_SLProps
+    ad = BRepAdaptor_Surface(face)
+    props = BRepLProp_SLProps(ad, 2, 1e-6)
+    u0, u1 = ad.FirstUParameter(), ad.LastUParameter()
+    v0, v1 = ad.FirstVParameter(), ad.LastVParameter()
+    rmin = math.inf
+    for i in range(samples):
+        for j in range(samples):
+            try:
+                props.SetParameters(u0 + (u1 - u0) * (i + 0.5) / samples,
+                                    v0 + (v1 - v0) * (j + 0.5) / samples)
+                if not props.IsCurvatureDefined():
+                    continue
+                c = max(abs(props.MaxCurvature()), abs(props.MinCurvature()))
+                if c > 1e-9:
+                    rmin = min(rmin, 1.0 / c)
+            except Exception:
+                continue
+    return rmin
+
+
+def grow_tangent(shape, seed_ids, angle_deg=20.0, max_faces=300,
+                 min_radius=2.5):
     """Expand seed face ids across tangent-continuous shared edges.
 
     Two faces are considered smoothly connected when their outward normals
-    at the shared edge's midpoint differ by less than angle_deg.
+    at the shared edge's midpoint differ by less than angle_deg. Faces whose
+    tightest curvature radius is below min_radius (edge-break fillets,
+    roundovers) act as barriers — otherwise tangent growth floods through
+    rounded wall ends onto the far side of the shell.
     """
     from OCP.TopExp import TopExp_Explorer
 
@@ -51,6 +78,7 @@ def grow_tangent(shape, seed_ids, angle_deg=20.0, max_faces=300):
 
     cos_tol = math.cos(math.radians(angle_deg))
     selected = set(int(i) for i in seed_ids)
+    barred = set()
     frontier = list(selected)
     while frontier and len(selected) < max_faces:
         fid = frontier.pop()
@@ -78,12 +106,16 @@ def grow_tangent(shape, seed_ids, angle_deg=20.0, max_faces=300):
                 continue
             for other in others:
                 ofid = face_id(other)
-                if ofid in selected:
+                if ofid in selected or ofid in barred:
                     continue
                 n_other = _face_normal_at(other, pmid)
                 if n_other is None:
                     continue
-                if float(np.dot(n_here, n_other)) >= cos_tol:
-                    selected.add(ofid)
-                    frontier.append(ofid)
+                if float(np.dot(n_here, n_other)) < cos_tol:
+                    continue
+                if min_radius and _face_min_radius(other) < min_radius:
+                    barred.add(ofid)
+                    continue
+                selected.add(ofid)
+                frontier.append(ofid)
     return sorted(selected)
