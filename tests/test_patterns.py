@@ -42,6 +42,34 @@ def test_stochastic_reproducible():
     assert len(a) == len(b) and np.allclose(np.array(a[0]), np.array(b[0]))
 
 
+def test_offset_shifts_lattice_phase():
+    base = RibParams(pattern="rectangular", spacing=10)
+    off = RibParams(pattern="rectangular", spacing=10,
+                    offset_x=3.0, offset_y=2.0)
+    a = generate_segments(base, B)
+    b = generate_segments(off, B)
+
+    def phases(segs, vertical):
+        vals = set()
+        for s in segs:
+            (x0, y0), (x1, y1) = s[0], s[1]
+            if vertical and abs(x1 - x0) < 1e-9:
+                vals.add(round(x0 % 10.0, 6) % 10.0)
+            if not vertical and abs(y1 - y0) < 1e-9:
+                vals.add(round(y0 % 10.0, 6) % 10.0)
+        return sorted(vals)
+
+    pa_v, pb_v = phases(a, True), phases(b, True)
+    pa_h, pb_h = phases(a, False), phases(b, False)
+    assert len(pa_v) == 1 and len(pb_v) == 1
+    assert (pb_v[0] - pa_v[0]) % 10.0 == pytest.approx(3.0, abs=1e-6)
+    assert (pb_h[0] - pa_h[0]) % 10.0 == pytest.approx(2.0, abs=1e-6)
+    # offsetting by full periods is a no-op
+    per = generate_segments(RibParams(pattern="rectangular", spacing=10,
+                                      offset_x=10.0, offset_y=20.0), B)
+    assert phases(per, True) == pa_v and phases(per, False) == pa_h
+
+
 def test_clip_stays_inside():
     p = RibParams(pattern="triangular", spacing=10, margin=3)
     lines = clip_and_border(generate_segments(p, B), SQUARE, p)

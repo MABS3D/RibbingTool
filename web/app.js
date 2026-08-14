@@ -80,6 +80,8 @@ function gatherParams() {
     thickness: num('thickness'),
     height: num('height'),
     orientation_deg: num('orientation'),
+    offset_x: num('offset-x'),
+    offset_y: num('offset-y'),
     draft_deg: num('draft'),
     margin: num('margin'),
     border: $('border').checked,

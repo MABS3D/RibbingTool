@@ -25,6 +25,8 @@ class RibParams:
     fillet_root: float = 0.0  # radius blending rib walls into the body
     fillet_top: float = 0.0   # radius rounding the rib top edges
     mapping: str = "unfold"   # unfold (surface metric) | project (front view)
+    offset_x: float = 0.0    # lattice phase shift in the pattern plane (mm)
+    offset_y: float = 0.0
 
     @classmethod
     def from_dict(cls, d):
@@ -126,6 +128,18 @@ def _stochastic(bounds, density, seed):
 
 def generate_segments(params, bounds):
     """Segment network covering bounds, rotated by orientation_deg."""
+    ox, oy = params.offset_x, params.offset_y
+    if ox or oy:
+        # families anchor their phase on the window center, so shifting the
+        # window cancels the offset — expand symmetrically (center intact),
+        # translate the segments, and let clipping drop the overshoot
+        from dataclasses import replace
+        minx, miny, maxx, maxy = bounds
+        pad = abs(ox) + abs(oy)
+        segs = generate_segments(
+            replace(params, offset_x=0.0, offset_y=0.0),
+            (minx - pad, miny - pad, maxx + pad, maxy + pad))
+        return [tuple((q[0] + ox, q[1] + oy) for q in s) for s in segs]
     p, sp, rot = params.pattern, params.spacing, params.orientation_deg
     base = params.base_angle_deg
     if p in ("rectangular", "quadmesh"):
