@@ -557,19 +557,211 @@ def _cluster_mesh(mapper, poly, params, top_offsets, step, quality,
         if len(ratio) and (ratio.max() > 1.8 or ratio.min() < 0.55):
             return None
 
-    nb = len(verts2d)
-    v = np.vstack([bot3, top3])            # bottom block, then top block
+    r_root = float(max(params.fillet_root, 0.0))
+    r_top = float(np.clip(params.fillet_top, 0.0,
+                          0.35 * params.thickness))
+    if r_root <= 0 and r_top <= 0:
+        nb = len(verts2d)
+        v = np.vstack([bot3, top3])        # bottom block, then top block
+        faces = []
+        for a, b, c in tris:
+            faces.append((a + nb, b + nb, c + nb))   # top faces up
+            faces.append((a, c, b))                  # bottom faces down
+        for off, n in ranges:
+            for i in range(n):
+                a = off + i
+                b = off + (i + 1) % n
+                faces.append((a, b, b + nb))
+                faces.append((a, b + nb, a + nb))
+        return v, np.asarray(faces, np.int64)
+
+    return _cluster_mesh_filleted(mapper, params, top_offsets, rings2d,
+                                  ranges, verts2d, tris, r_root, r_top)
+
+
+def _ring_normals(ring2d):
+    """Per-vertex outward 2D normals (CCW exterior / CW holes), smoothed."""
+    t = np.roll(ring2d, -1, axis=0) - np.roll(ring2d, 1, axis=0)
+    ln = np.linalg.norm(t, axis=1, keepdims=True)
+    t = t / np.clip(ln, 1e-12, None)
+    w = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    for _ in range(2):                     # tame reflex-corner spikes
+        w = w + np.roll(w, 1, axis=0) + np.roll(w, -1, axis=0)
+        w = w / np.clip(np.linalg.norm(w, axis=1, keepdims=True), 1e-12, None)
+    return w
+
+
+def _cluster_mesh_filleted(mapper, params, top_offsets, rings2d, ranges,
+                           verts2d, tris, r_root, r_top):
+    """Ring-stack cluster mesh with root/crown fillet bands.
+
+    Bottom cap sits on the outward-offset skirt rings; quarter-round arc
+    levels blend skirt -> wall -> inset top, so ribs emerge organically from
+    the body instead of being plastered onto it.
+    """
+    import manifold3d as m3d
+
+    def shoelace(r):
+        x, y = r[:, 0], r[:, 1]
+        return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+    def valid_triangulation(rings):
+        try:
+            t = np.asarray(
+                m3d.triangulate([r.astype(np.float64) for r in rings]),
+                np.int64)
+        except Exception:
+            return None
+        vv = np.vstack(rings)
+        e1 = vv[t[:, 1]] - vv[t[:, 0]]
+        e2 = vv[t[:, 2]] - vv[t[:, 0]]
+        signed = 0.5 * (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0])
+        ref = sum(shoelace(r) for r in rings)
+        if (len(signed) == 0 or signed.min() < -1e-9 or ref <= 0
+                or abs(signed.sum() - ref) > max(0.5, 0.01 * ref)):
+            return None
+        return t[signed > 1e-9]
+
+    normals = [_ring_normals(r) for r in rings2d]
+    KR, KT = 3, 3
+    H = np.asarray(np.broadcast_to(
+        np.asarray(top_offsets(verts2d, params.height), float),
+        (len(verts2d),)))
+
+    # 2D rings and heights per stack level (bottom cap upward)
+    levels = []                            # (ring2d list, h array list)
+    skirt = [r + w * r_root for r, w in zip(rings2d, normals)]
+    levels.append((skirt, [np.full(len(r), -params.embed) for r in skirt]))
+    if r_root > 0:
+        for j in range(KR + 1):
+            th = (math.pi / 2) * j / KR
+            l2d = [r + w * r_root * (1 - math.sin(th))
+                   for r, w in zip(rings2d, normals)]
+            levels.append((l2d, [np.full(len(r), r_root * (1 - math.cos(th)))
+                                 for r in l2d]))
+    inset = ([r - w * r_top for r, w in zip(rings2d, normals)]
+             if r_top > 0 else rings2d)
+    if r_top > 0:
+        for j in range(KT + 1):
+            th = (math.pi / 2) * j / KT
+            l2d = [r - w * r_top * (1 - math.cos(th))
+                   for r, w in zip(rings2d, normals)]
+            hs = []
+            off = 0
+            for r in l2d:
+                n = len(r)
+                hv = H[off:off + n] - r_top * (1 - math.sin(th))
+                hs.append(np.clip(hv, r_root, None))
+                off += n
+            levels.append((l2d, hs))
+    else:
+        hs, off = [], 0
+        for r in rings2d:
+            hs.append(H[off:off + len(r)])
+            off += len(r)
+        levels.append((rings2d, hs))
+
+    bot_tris = valid_triangulation(skirt)
+    top_tris = valid_triangulation(inset) if r_top > 0 else tris
+    if bot_tris is None or top_tris is None:
+        return None                        # offset rings self-defeated
+
+    S = len(levels)
+    counts = [len(r) for r in rings2d]
+    n_ring_total = sum(counts)
+    all_v = []
+    for l2d, hs in levels:
+        # offset skirt/inset rings may poke past the flat domain edge —
+        # snapping them back onto it is the correct fillet run-out there
+        pts = _map_points(mapper, np.vstack(l2d), np.concatenate(hs),
+                          max_snap=max(r_root, r_top) + 0.6)
+        if pts is None:
+            return None
+        all_v.append(pts)
+    v = np.vstack(all_v)
+
+    def gv(level, idx):
+        return level * n_ring_total + idx
+
     faces = []
-    for a, b, c in tris:
-        faces.append((a + nb, b + nb, c + nb))   # top faces up
-        faces.append((a, c, b))                  # bottom faces down
-    for off, n in ranges:
-        for i in range(n):
-            a = off + i
-            b = off + (i + 1) % n
-            faces.append((a, b, b + nb))
-            faces.append((a, b + nb, a + nb))
+    for a, b, c in top_tris:
+        faces.append((gv(S - 1, a), gv(S - 1, b), gv(S - 1, c)))
+    for a, b, c in bot_tris:
+        faces.append((gv(0, a), gv(0, c), gv(0, b)))
+    for lev in range(S - 1):
+        for off, n in ranges:
+            for i in range(n):
+                a = off + i
+                b = off + (i + 1) % n
+                faces.append((gv(lev, a), gv(lev, b), gv(lev + 1, b)))
+                faces.append((gv(lev, a), gv(lev + 1, b), gv(lev + 1, a)))
     return v, np.asarray(faces, np.int64)
+
+
+def _root_bead(mapper, poly, r_root, params, step, quality):
+    """Additive quarter-round bead swept along a cluster's base contour.
+
+    Fillet geometry as its own watertight tube: it unions into the corner
+    between rib wall and body at export and can never cost rib coverage.
+    """
+    from shapely.geometry.polygon import orient
+
+    poly = orient(poly, 1.0)
+    K = 4
+    theta = [(math.pi / 2) * j / K for j in range(K + 1)]
+    # profile in (outward, height): arc surface->wall, then close through
+    # the material corner
+    prof = ([(r_root * (1 - math.sin(t)), r_root * (1 - math.cos(t)))
+             for t in theta]
+            + [(-0.15, r_root * 0.7), (-0.15, -0.15),
+               (r_root * 0.7, -0.15)])
+    m = len(prof)
+    meshes = []
+    for ring in [poly.exterior, *poly.interiors]:
+        L = ring.length
+        if L < 2.0:
+            continue
+        probe = np.array([ring.interpolate(f * L).coords[0]
+                          for f in (0.0, 0.33, 0.66)])
+        r_loc = mapper.min_curvature_radius(probe)
+        step_r = step if math.isinf(r_loc) else float(
+            np.clip(0.07 * r_loc, 0.3 / max(quality, 1.0), step))
+        n = max(8, int(math.ceil(L / step_r)))
+        ring2d = np.array([ring.interpolate(i * L / n).coords[0]
+                           for i in range(n)])
+        # continuity guard: rings crossing flattening slits jump across
+        # openings in 3D and would sweep the bead into giant fans
+        base3 = _map_points(mapper, ring2d, 0.0, max_snap=r_root + 0.6)
+        if base3 is None:
+            continue
+        d2 = np.linalg.norm(np.roll(ring2d, -1, axis=0) - ring2d, axis=1)
+        d3 = np.linalg.norm(np.roll(base3, -1, axis=0) - base3, axis=1)
+        if (d3 > 3.0 * np.clip(d2, 1e-9, None) + 1.0).any():
+            continue
+        w = _ring_normals(ring2d)
+        pts2d = np.vstack([ring2d + w * off for off, _ in prof])
+        hs = np.concatenate([np.full(n, h) for _, h in prof])
+        pts3d = _map_points(mapper, pts2d, hs, max_snap=r_root + 0.6)
+        if pts3d is None:
+            continue
+        faces = []
+        for p in range(m):
+            p2 = (p + 1) % m
+            for i in range(n):
+                i2 = (i + 1) % n
+                a = p * n + i
+                b = p * n + i2
+                c = p2 * n + i2
+                d = p2 * n + i
+                faces.append((a, b, c))
+                faces.append((a, c, d))
+        f = np.asarray(faces, np.int64)
+        vol = np.einsum("ij,ij->i", pts3d[f[:, 0]],
+                        np.cross(pts3d[f[:, 1]], pts3d[f[:, 2]])).sum() / 6.0
+        if vol < 0:
+            f = f[:, ::-1]
+        meshes.append((pts3d, f))
+    return meshes
 
 
 def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
@@ -616,19 +808,21 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
             w_bot = params.thickness / 2.0
             import shapely as _shp
             taper = params.taper_len > 0 and not params.border
-            bnd_line = (boundary.buffer(-params.margin).boundary
-                        if taper else None)
+            inset_poly = boundary.buffer(-params.margin) if taper else None
+            bnd_line = inset_poly.boundary if taper else None
 
-            # taper floor: sub-0.35mm tips render/print as chewed slivers
-            f_min = float(min(0.5, 0.35 / max(params.height, 0.1)))
-
+            # cluster meshes taper to a true knife edge: distance must be
+            # SIGNED — capsule cap tips poke past the clip line, and unsigned
+            # distance would ramp them back up instead of to zero
             def top_offsets(pts2d, full_height):
                 if not taper:
                     return full_height
-                d = _shp.distance(_shp.points(np.asarray(pts2d)), bnd_line)
+                pts = _shp.points(np.asarray(pts2d))
+                d = _shp.distance(pts, bnd_line)
+                d = np.where(_shp.contains(inset_poly, pts), d, 0.0)
                 if d.min() >= params.taper_len:
                     return full_height
-                return full_height * np.clip(d / params.taper_len, f_min, 1.0)
+                return full_height * np.clip(d / params.taper_len, 0.0, 1.0)
 
             # prefilter conformal-stretch monsters BEFORE clustering: one
             # pinched segment must not poison a lattice-wide cluster
@@ -656,6 +850,11 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
             polys = [p for p in getattr(merged, "geoms", [merged])
                      if p.area > 1e-6]
             reps_pts = [c.representative_point() for c in caps]
+            from dataclasses import replace as _dc_replace
+            no_fillet = (_dc_replace(params, fillet_root=0.0, fillet_top=0.0)
+                         if (params.fillet_root > 0 or params.fillet_top > 0)
+                         else None)
+            fillet_misses = 0
             for poly in polys:
                 members = [i for i, rp in enumerate(reps_pts)
                            if poly.contains(rp)]
@@ -664,6 +863,23 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                                          step, quality)
                 except Exception:
                     mesh = None
+                if mesh is None and no_fillet is not None:
+                    # fillets must never cost coverage: degrade this cluster
+                    # to plain geometry and lay an additive root bead along
+                    # its base contour instead
+                    fillet_misses += len(members)
+                    try:
+                        mesh = _cluster_mesh(mapper, poly, no_fillet,
+                                             top_offsets, step, quality)
+                    except Exception:
+                        mesh = None
+                    if mesh is not None and params.fillet_root > 0:
+                        try:
+                            clusters.extend(_root_bead(
+                                mapper, poly, params.fillet_root, params,
+                                step, quality))
+                        except Exception:
+                            pass
                 if mesh is not None:
                     clusters.append(mesh)
                     rep.lofted += len(members)
@@ -683,6 +899,10 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                     else:
                         clusters.append(seg_mesh)
                         rep.lofted += 1
+            if fillet_misses:
+                rep.warnings.append(
+                    f"fillets skipped on {fillet_misses} ribs "
+                    "(boundary-adjacent clusters built without them)")
         except FlattenError as e:
             rep.warnings.append(str(e))
         except RibbingError:

@@ -22,6 +22,8 @@ class RibParams:
     seed: int = 1
     base_angle_deg: float = 0.0
     taper_len: float = 5.0   # run-out length at open boundaries (0 = off)
+    fillet_root: float = 0.0  # radius blending rib walls into the body
+    fillet_top: float = 0.0   # radius rounding the rib top edges
 
     @classmethod
     def from_dict(cls, d):

@@ -83,6 +83,8 @@ function gatherParams() {
     margin: num('margin'),
     border: $('border').checked,
     taper_len: num('taper'),
+    fillet_root: num('fillet-root'),
+    fillet_top: num('fillet-top'),
     density: num('density'),
     seed: num('seed'),
   };
