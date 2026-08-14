@@ -3,7 +3,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 from scipy.spatial import Voronoi
-from shapely.geometry import LineString, MultiLineString
+from shapely.geometry import LineString, MultiLineString, Polygon
 
 
 @dataclass
@@ -165,13 +165,27 @@ def clip_and_border(segments, boundary, params):
             elif hasattr(g, "geoms"):
                 stack.extend(g.geoms)
     if params.border:
+        # uniform arc-length resampling: raw region boundaries carry
+        # thousands of mesh-edge vertices and would explode into thousands
+        # of micro-ribs (minutes-long applies)
+        step_b = float(min(max(params.spacing / 3.0, 2.0), 6.0))
+        budget = 1200
         for poly in getattr(inset, "geoms", [inset]):
             for ring in [poly.exterior, *poly.interiors]:
-                coords = list(ring.simplify(0.15).coords)
-                for i in range(len(coords) - 1):
-                    seg = LineString([coords[i], coords[i + 1]])
-                    if seg.length > 0.05:
-                        out.append(seg)
+                L = ring.length
+                if L < 4 * params.thickness:
+                    continue
+                # slit artifacts: long rings enclosing ~no area
+                ring_area = abs(Polygon(ring).area)
+                if ring_area < params.thickness * L:
+                    continue
+                n = max(8, int(L / step_b))
+                if n > budget:
+                    continue
+                budget -= n
+                pts = [ring.interpolate(i * L / n) for i in range(n + 1)]
+                for i in range(n):
+                    out.append(LineString([pts[i], pts[i + 1]]))
     return out
 
 

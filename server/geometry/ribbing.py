@@ -234,7 +234,9 @@ class _RegionMapper:
         d3 = np.linalg.norm(np.diff(np.vstack([out, out[:1]]), axis=0),
                             axis=1)
         p2, p3 = d2.sum(), d3.sum()
-        if p2 > 1e-9 and not (0.4 <= p3 / p2 <= 2.5):
+        # ARAP keeps the flattening near-isometric, so surviving ribs should
+        # map close to their flat size — anything beyond this is pathology
+        if p2 > 1e-9 and not (0.55 <= p3 / p2 <= 1.8):
             return None
         # a single 3D edge jumping much further than its flat length means
         # the loop crossed an internal slit — a bowtie rib, not a rib

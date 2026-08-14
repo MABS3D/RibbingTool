@@ -29,9 +29,7 @@ def test_cruscotto_external_skin(path_fx, seed, request):
     total_segments = sum(r.segments for r in reports)
     total_lofted = sum(r.lofted for r in reports)
     assert total_lofted > 100
-    # part1's curated skin builds >95%; auto-seeded regions on part2 hit
-    # high-distortion zones where the artifact guards reject more ribs
-    assert total_lofted >= total_segments * 0.45
+    assert total_lofted >= total_segments * 0.9   # <10% skipped
     assert all(shape_volume(x) > 0 for x in solids[:20])
 
 

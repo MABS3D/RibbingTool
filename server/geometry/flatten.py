@@ -19,9 +19,35 @@ def _tri_areas(v, f):
     return 0.5 * (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
 
 
-def flatten(mesh):
-    """LSCM-flatten a FaceMesh to 2D. Area-true scale, centered at origin.
+def _arap_refine(v, f, uv):
+    """Refine a conformal flattening with ARAP (near-isometric).
 
+    LSCM preserves angles but lets area stretch explode in pinched zones —
+    ribs there map to monsters. ARAP minimizes stretch directly.
+    """
+    try:
+        b = np.array([int(f[0, 0])], dtype=np.int32)
+        bc = np.ascontiguousarray(uv[b.astype(np.int64)], dtype=np.float64)
+        data = igl.ARAPData()
+        igl.arap_precomputation(
+            np.ascontiguousarray(v, np.float64),
+            np.ascontiguousarray(f, np.int64), 2, b, data)
+        uv2 = np.ascontiguousarray(uv, dtype=np.float64)
+        for _ in range(6):
+            uv2 = igl.arap_solve(bc, data, uv2)
+        if (uv2 is not None and len(uv2) == len(uv)
+                and np.isfinite(uv2).all()
+                and abs(_tri_areas(uv2, f).sum()) > 1e-12):
+            return uv2
+    except Exception:
+        pass
+    return uv
+
+
+def flatten(mesh):
+    """Flatten a FaceMesh to 2D: LSCM init + ARAP refinement.
+
+    Area-true scale, centered at origin, PCA-aligned.
     Raises FlattenError for closed surfaces or genus > 0.
     """
     v = np.ascontiguousarray(mesh.vertices, dtype=np.float64)
@@ -48,6 +74,7 @@ def flatten(mesh):
     uv = igl.lscm(v, f, b, bc)[0]
     if uv is None or len(uv) != len(v) or not np.isfinite(uv).all():
         raise FlattenError("LSCM flattening failed for this face")
+    uv = _arap_refine(v, f, uv)
     area2d = _tri_areas(uv, f).sum()
     if abs(area2d) < 1e-12:
         raise FlattenError("LSCM flattening collapsed (degenerate face)")
