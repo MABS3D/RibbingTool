@@ -115,7 +115,7 @@ def _flatten_with_cuts(region):
 class _RegionMapper:
     """Maps flattened 2D points back onto the true (multi-face) surface."""
 
-    def __init__(self, region, flat, body, triangles=None):
+    def __init__(self, region, flat, body, triangles=None, min_cos=None):
         from shapely.strtree import STRtree
         self.region = region
         self.flat = flat
@@ -127,7 +127,18 @@ class _RegionMapper:
         e1 = flat[t[:, 1]] - flat[t[:, 0]]
         e2 = flat[t[:, 2]] - flat[t[:, 0]]
         signed = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
-        self.valid_idx = np.nonzero(signed > 1e-12)[0]
+        if min_cos is None:
+            self.valid_idx = np.nonzero(signed > 1e-12)[0]
+        else:
+            # projected mapping: a triangle's 2D signed area is its 3D area
+            # times (unit normal . projection axis), so this drops steep and
+            # back-facing triangles — their compressed shadows must not
+            # locate points
+            v3 = region.vertices
+            a3 = np.linalg.norm(np.cross(v3[t[:, 1]] - v3[t[:, 0]],
+                                         v3[t[:, 2]] - v3[t[:, 0]]), axis=1)
+            self.valid_idx = np.nonzero(
+                signed > np.maximum(min_cos * a3, 1e-12))[0]
         self.tree = STRtree([Polygon(flat[t[i]]) for i in self.valid_idx])
         self.props = {}
         self.sign = {}
@@ -788,6 +799,70 @@ def _root_bead(mapper, poly, r_root, params, top_offsets, step, quality):
     return meshes
 
 
+def _projection_frame(regions):
+    """Shared projected-mapping frame: (center, (3,2) in-plane axes).
+
+    ONE best-fit plane for ALL regions puts disjoint panels in a single 2D
+    space so they can share lattice phase. Axis signs are deterministic, and
+    (u, v, n) is right-handed with the outward normal so front-facing
+    triangles keep their CCW winding in projection.
+    """
+    allv = np.vstack([r.vertices for r in regions])
+    ctr = allv.mean(axis=0)
+    x = allv - ctr
+    _, vecs = np.linalg.eigh(x.T @ x)      # ascending variance
+    n = vecs[:, 0]                         # least variance = view normal
+    outward = np.zeros(3)
+    for r in regions:
+        v = r.vertices
+        outward += np.cross(v[r.triangles[:, 1]] - v[r.triangles[:, 0]],
+                            v[r.triangles[:, 2]] - v[r.triangles[:, 0]]
+                            ).sum(axis=0)
+    if n @ outward < 0:
+        n = -n
+    u = vecs[:, 1]
+    if u[int(np.argmax(np.abs(u)))] < 0:
+        u = -u
+    return ctr, np.stack([u, np.cross(n, u)], axis=1)
+
+
+def _lattice_window(params, bounds):
+    """Origin-symmetric generation window on whole lattice periods.
+
+    The family generators phase their lines through the window center;
+    pinning that center at the projection origin gives every domain in the
+    same frame the same global lattice phase — panels separated by grooves,
+    recesses, or seams stay period-aligned. (Hex walls are index-anchored
+    already; stochastic just gets a window-stable seed cloud.)
+    """
+    sx = max(params.spacing, 1e-6)
+    sy = sx
+    if params.pattern == "rectangular" and params.spacing_y:
+        sy = max(params.spacing_y, 1e-6)
+    minx, miny, maxx, maxy = bounds
+    hx = sx * (math.floor(max(abs(minx), abs(maxx)) / sx) + 1)
+    hy = sy * (math.floor(max(abs(miny), abs(maxy)) / sy) + 1)
+    return (-hx, -hy, hx, hy)
+
+
+def _kept_domain(flat, triangles, valid_idx):
+    """Projected clip boundary: union of the front-facing triangles only.
+
+    Steep walls and undercuts are no rib territory, and without them the
+    kept set may be DISCONNECTED (wings + recess floors) — a MultiPolygon
+    the downstream clip/margin/taper machinery accepts as-is.
+    """
+    import shapely
+    tri = flat[triangles[valid_idx]]
+    if len(tri) == 0:
+        return None
+    tri = np.concatenate([tri, tri[:, :1]], axis=1)   # close the rings
+    geom = shapely.union_all(shapely.polygons(tri))
+    if geom is not None and not geom.is_valid:
+        geom = geom.buffer(0)
+    return geom
+
+
 def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
     """Fast-engine rib builder: watertight cluster meshes, junction-free.
 
@@ -805,14 +880,33 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
     regions = region_meshes(shape, face_ids, lin_defl)
     if not regions:
         raise RibbingError("selected faces could not be triangulated")
+    project = params.mapping == "project"
+    if project:
+        p_ctr, p_axes = _projection_frame(regions)
     clusters, reports = [], []
     for region in regions:
         rep = RibReport(face_id=region.face_ids[0], face_ids=region.face_ids)
         reports.append(rep)
         try:
-            flat, map_tris = _flatten_with_cuts(region)
-            boundary = _flat_boundary(map_tris, flat)
-            lines = clip_and_border(generate_segments(params, boundary.bounds),
+            if project:
+                # lattice lives in the shared front-view plane: phase stays
+                # continuous across grooves/recesses, where surface-metric
+                # unfolding spends whole periods walking their walls
+                flat = (region.vertices - p_ctr) @ p_axes
+                map_tris = region.triangles
+                mapper = _RegionMapper(region, flat, shape,
+                                       triangles=map_tris, min_cos=0.30)
+                boundary = _kept_domain(flat, map_tris, mapper.valid_idx)
+                if boundary is None or boundary.is_empty:
+                    rep.warnings.append(
+                        "region is edge-on to the projection plane")
+                    continue
+                gen_bounds = _lattice_window(params, boundary.bounds)
+            else:
+                flat, map_tris = _flatten_with_cuts(region)
+                boundary = _flat_boundary(map_tris, flat)
+                gen_bounds = boundary.bounds
+            lines = clip_and_border(generate_segments(params, gen_bounds),
                                     boundary, params)
             subsegs = []
             for ls in lines:
@@ -827,7 +921,9 @@ def build_rib_meshes(shape, face_ids, params, lin_defl=0.4, quality=1.0):
                     f"(max {MAX_SEGMENTS}) — increase spacing or lower density")
             rep.segments = len(subsegs)
 
-            mapper = _RegionMapper(region, flat, shape, triangles=map_tris)
+            if not project:
+                mapper = _RegionMapper(region, flat, shape,
+                                       triangles=map_tris)
             mapper.domain = boundary   # lets _map_points clamp boundary pokes
             step = float(np.clip(params.spacing / 6.0, 0.7, 1.5))
             w_bot = params.thickness / 2.0

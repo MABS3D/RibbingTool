@@ -192,7 +192,9 @@ def api_ribs(req: RibsRequest):
     if engine == "auto":
         by_id = {m.face_id: m for m in (STATE["meshes"] or [])}
         all_planar = all(by_id[f].is_planar for f in req.face_ids if f in by_id)
-        engine = "exact" if all_planar else "fast"
+        # projected mapping only exists in the fast engine
+        engine = ("exact" if all_planar and params.mapping != "project"
+                  else "fast")
 
     try:
         if engine == "exact":

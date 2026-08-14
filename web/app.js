@@ -74,6 +74,7 @@ function gatherParams() {
   const num = (id) => { const v = $(id).value; return v === '' ? null : Number(v); };
   return {
     pattern: $('pattern').value,
+    mapping: $('mapping').value,
     spacing: num('spacing'),
     spacing_y: num('spacing-y'),
     thickness: num('thickness'),
