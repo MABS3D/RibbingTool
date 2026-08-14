@@ -74,8 +74,10 @@ boundary inset margin, embed depth. Units: mm and degrees.
 
 - Conformal flattening distorts area on strongly curved regions → pattern spacing
   drifts there. Accepted trade-off.
-- Faces that are closed surfaces (full sphere/torus/cylinder without seam edges) are
-  rejected with an explanatory error.
+- Closed periodic faces (full cylinders, tori) arrive from OCCT pre-cut at the
+  parametric seam and unroll fine — but the rib pattern does not join across the seam
+  line. Only genuinely boundary-less/genus>0 meshes are rejected with an explanatory
+  error. (Verified: a full cylinder lateral face unrolls near-isometrically.)
 - Warn when rib height exceeds the local minimum curvature radius (self-intersection
   risk); proceed anyway.
 - No assemblies (first/only solid per file), no variable-density patterns, no fillets
