@@ -424,10 +424,17 @@ def _region_ribs(shape, region, params, rep, stagger, quality=1.0):
         else:
             d_embed, d_height = params.embed, params.height
         try:
-            bot2, ns = capsule(p0, p1, w_bot, step=step, cap_pts=cap_pts,
+            # curvature-adaptive sampling: silhouettes kink visibly when the
+            # bend angle per facet exceeds a few degrees, so tightly curved
+            # ribs sample finer (~4 deg per segment) than flat ones
+            r_loc = mapper.min_curvature_radius(np.array(
+                [p0, p1, ((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2)]))
+            step_i = step if math.isinf(r_loc) else float(
+                np.clip(0.07 * r_loc, 0.3 / max(quality, 1.0), step))
+            bot2, ns = capsule(p0, p1, w_bot, step=step_i, cap_pts=cap_pts,
                                return_meta=True)
             bot3 = mapper.map_loop(bot2, -d_embed)
-            top2 = capsule(p0, p1, w_top, step=step, cap_pts=cap_pts)
+            top2 = capsule(p0, p1, w_top, step=step_i, cap_pts=cap_pts)
             off = top_offsets(top2, d_height)
             top3 = mapper.map_loop(top2, off)
             if bot3 is None or top3 is None or _folded(bot3, top3):
