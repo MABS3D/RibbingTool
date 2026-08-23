@@ -44,6 +44,30 @@ def test_ribs_undo_export(box_step):
     assert r.status_code == 400
 
 
+def test_engine_routing(box_step):
+    c = TestClient(app)
+    d0 = _load(c, box_step)
+    big = max(d0["faces"], key=lambda f: f["area"])["id"]
+    # projected mapping routes auto -> implicit (the SDF kernel)
+    r = c.post("/api/ribs", json={
+        "face_ids": [big],
+        "params": {"pattern": "quadmesh", "spacing": 12,
+                   "mapping": "project"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["engine"] == "implicit"
+    c.post("/api/undo")
+    # implicit + unfold is a clear client error
+    r = c.post("/api/ribs", json={"face_ids": [big], "engine": "implicit",
+                                  "params": {"mapping": "unfold"}})
+    assert r.status_code == 400
+    # explicit fast + project still allowed (comparison/debugging)
+    r = c.post("/api/ribs", json={
+        "face_ids": [big], "engine": "fast",
+        "params": {"pattern": "quadmesh", "spacing": 12,
+                   "mapping": "project"}})
+    assert r.status_code == 200 and r.json()["engine"] == "fast"
+
+
 def test_load_path(box_step):
     c = TestClient(app)
     r = c.post("/api/load_path", json={"path": str(box_step)})

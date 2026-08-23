@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from .geometry.booleans import BooleanError, _shape_to_mesh, mesh_union
 from .geometry.flatten import FlattenError
+from .geometry.implicit import build_rib_implicit
 from .geometry.meshing import mesh_shape
 from .geometry.patterns import RibParams
 from .geometry.ribbing import (
@@ -189,14 +190,16 @@ def api_ribs(req: RibsRequest):
     params = RibParams.from_dict(req.params)
 
     engine = req.engine
-    if engine not in ("auto", "fast", "exact"):
+    if engine not in ("auto", "implicit", "fast", "exact"):
         raise HTTPException(400, f"unknown engine: {engine}")
     if engine == "auto":
-        by_id = {m.face_id: m for m in (STATE["meshes"] or [])}
-        all_planar = all(by_id[f].is_planar for f in req.face_ids if f in by_id)
-        # projected mapping only exists in the fast engine
-        engine = ("exact" if all_planar and params.mapping != "project"
-                  else "fast")
+        if params.mapping == "project":
+            engine = "implicit"       # the SDF kernel owns projected applies
+        else:
+            by_id = {m.face_id: m for m in (STATE["meshes"] or [])}
+            all_planar = all(by_id[f].is_planar
+                             for f in req.face_ids if f in by_id)
+            engine = "exact" if all_planar else "fast"
 
     try:
         if engine == "exact":
@@ -205,12 +208,14 @@ def api_ribs(req: RibsRequest):
             welded = fuse_into(entry["shape"], entry["overlay"] + solids, reports)
             _push(welded, [], [])
         else:
-            clusters, reports = build_rib_meshes(entry["shape"], req.face_ids,
-                                                 params,
-                                                 frame_cache=STATE["frame_cache"])
+            build = (build_rib_implicit if engine == "implicit"
+                     else build_rib_meshes)
+            clusters, reports = build(entry["shape"], req.face_ids, params,
+                                      frame_cache=STATE["frame_cache"])
             _push(entry["shape"], entry["overlay"] + clusters,
                   entry["recipes"] + [{"face_ids": list(req.face_ids),
-                                       "params": dict(req.params)}])
+                                       "params": dict(req.params),
+                                       "engine": engine}])
     except (RibbingError, FlattenError, BooleanError, StepError, ValueError) as e:
         raise HTTPException(400, str(e))
 
@@ -267,10 +272,13 @@ def _union_shells():
             for rec in entry["recipes"]:
                 # same frame cache as the interactive applies, so projected
                 # exports rebuild on the identical lattice
-                s, _ = build_rib_meshes(entry["shape"], rec["face_ids"],
-                                        RibParams.from_dict(rec["params"]),
-                                        quality=3.0,
-                                        frame_cache=STATE["frame_cache"])
+                build = (build_rib_implicit
+                         if rec.get("engine") == "implicit"
+                         else build_rib_meshes)
+                s, _ = build(entry["shape"], rec["face_ids"],
+                             RibParams.from_dict(rec["params"]),
+                             quality=3.0,
+                             frame_cache=STATE["frame_cache"])
                 fine += s
             solids = fine
         except Exception:
