@@ -28,6 +28,9 @@ class FrameGrids:
     mask: np.ndarray            # inside the closed, margin-inset domain
     Gu: np.ndarray = None       # smoothed clipped dD/du (slope correction)
     Gv: np.ndarray = None       # smoothed clipped dD/dv
+    Gm: np.ndarray = None       # gradient magnitude: the correction fades
+                                # to vertical as slope nears the cull, so
+                                # ribs on transition walls cannot fold
     Bo: np.ndarray = None       # distance to the OPEN boundary only
                                 # (taper ramp: cull rims must not fade it)
     Sc: np.ndarray = None       # distance to the slope-cull band: ribs end
@@ -40,18 +43,24 @@ class FrameGrids:
     gate_dlv: float = 1.0       # level spacing
 
 
-def make_gradients(D, cell, max_slope=3.1):
+def make_gradients(D, cell, max_slope=3.1, smooth_mm=None):
     """Depth-map gradients for surface-normal rib extrusion.
 
     Clipped to the kept-filter slope (~72 deg) so infilled separator steps
-    cannot spike them, then smoothed so marching cubes sees a stable frame.
+    cannot spike them, then gaussian-smoothed. Two variants are used: the
+    default light smoothing (2 cells) for CULL DETECTION (heavy smoothing
+    suppresses the peak slope of tight walls and they escape the cull,
+    emerging as crumpled rib sheets), and smooth_mm=1.5 for the NORMAL
+    CORRECTION (raster noise otherwise wobbles the correction at pattern
+    wavelength and ribs read as melted wax on curved transitions).
     """
     from scipy.ndimage import gaussian_filter
     Gu, Gv = np.gradient(D.astype(np.float32), cell)
     m = np.hypot(Gu, Gv)
     scale = np.where(m > max_slope, max_slope / np.clip(m, 1e-9, None), 1.0)
-    return (gaussian_filter(Gu * scale, 2.0).astype(np.float32),
-            gaussian_filter(Gv * scale, 2.0).astype(np.float32))
+    sigma = 2.0 if smooth_mm is None else max(2.0, smooth_mm / cell)
+    return (gaussian_filter(Gu * scale, sigma).astype(np.float32),
+            gaussian_filter(Gv * scale, sigma).astype(np.float32))
 
 
 def _bilinear(grid, u, v, cell, origin):
@@ -86,9 +95,19 @@ def field(u, v, d, grids, params):
         Du = _bilinear(g.Gu, u, v, g.cell, g.origin)
         Dv = _bilinear(g.Gv, u, v, g.cell, g.origin)
         c = 1.0 / np.sqrt(1.0 + Du * Du + Dv * Dv)
-        s = (d - D) * c
-        fu = u + s * Du * c
-        fv = v + s * Dv * c
+        # fade the correction to vertical as the slope nears the cull:
+        # past ~45 deg the lateral shift (s*tan) outgrows the transition
+        # band, ribs fold over themselves and read as crumpled wax.
+        # Vertical full-height ribs on the band look like standing fins.
+        q = np.ones_like(c)
+        if g.Gm is not None:
+            gm = _bilinear(g.Gm, u, v, g.cell, g.origin)
+            t_hi = math.tan(math.radians(55.0))
+            t_lo = math.tan(math.radians(42.0))
+            q = np.clip((t_hi - gm) / (t_hi - t_lo), 0.0, 1.0)
+        s = (d - D) * (1.0 + (c - 1.0) * q)
+        fu = u + s * Du * c * q
+        fv = v + s * Dv * c * q
     else:
         c = 1.0
         s = d - D
@@ -612,6 +631,8 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     Gu, Gv = make_gradients(D, cell)
     steep = binary_opening(
         np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
+    Gu, Gv = make_gradients(D, cell, smooth_mm=1.5)
+    Gm = np.hypot(Gu, Gv)
     # columns whose front surface is backed by material within a few mm
     # along the view ray: the heightfield can be trusted there. Over
     # recess floors and past the silhouette the front-most depth is a lip
@@ -699,8 +720,8 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         f"{time.time() - t_gate:.0f}s")
 
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, Bo=Bo, Sc=Sc, gate=gate, gate_d0=g_d0,
-                       gate_dlv=g_dlv)
+                       Gu=Gu, Gv=Gv, Gm=Gm, Bo=Bo, Sc=Sc, gate=gate,
+                       gate_d0=g_d0, gate_dlv=g_dlv)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
     rep.warnings += warn

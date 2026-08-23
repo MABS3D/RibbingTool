@@ -143,8 +143,18 @@ def main():
         return (np.asarray(out.vert_properties[:, :3]),
                 np.asarray(out.tri_verts))
 
-    bv2, bt2 = decim(bv, bt, 0.3)
+    # body: coarse tessellation, no decimation (the welded body mesh is
+    # not 2-manifold at seams, manifold3d rejects it). Ribs: decimate.
+    meshes_c = mesh_shape(s, 2.0, 2.0)
+    vs2, ts2, off2 = [], [], 0
+    for m in meshes_c:
+        vs2.append(np.asarray(m.vertices))
+        ts2.append(np.asarray(m.triangles, np.int64) + off2)
+        off2 += len(m.vertices)
+    bv2 = np.vstack(vs2)
+    bt2 = np.vstack(ts2).astype(np.int64)
     rv2, rt2 = decim(rv, rt, 0.35)
+    rt2 = rt2.astype(np.int64)
     allv = np.vstack([bv2, rv2])
     allt = np.vstack([bt2, rt2 + len(bv2)])
     color_ids = np.concatenate([np.zeros(len(bt2)), np.ones(len(rt2))])
