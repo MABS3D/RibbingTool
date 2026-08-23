@@ -28,6 +28,7 @@ class FrameGrids:
     mask: np.ndarray            # inside the closed, margin-inset domain
     Gu: np.ndarray = None       # smoothed clipped dD/du (slope correction)
     Gv: np.ndarray = None       # smoothed clipped dD/dv
+    C: np.ndarray = None        # distance to slope-cull rims (height fade)
 
 
 def make_gradients(D, cell, max_slope=3.1):
@@ -96,6 +97,12 @@ def field(u, v, d, grids, params):
     height = np.float32(params.height)
     if params.taper_len > 0 and not params.border:
         height = height * np.clip(B / params.taper_len, 0.0, 1.0)
+    if g.C is not None:
+        # ribs must die INTO the surface before a slope-cull rim — a
+        # full-height amputation at the cull line reads as chewed stubs.
+        # Border ribs are unaffected: this field ignores the outer boundary.
+        Cf = _bilinear(g.C, fu, fv, g.cell, g.origin)
+        height = height * np.clip(Cf / 3.0, 0.0, 1.0)
 
     half = np.float32(params.thickness / 2.0)
     if params.draft_deg > 0:
@@ -557,12 +564,15 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         D[~covered] = D[ri[~covered], ci[~covered]]
     # a heightfield with first-order normal correction cannot represent
     # near-cull walls: past ~55 deg the ribs shred. Cull steep BANDS from
-    # the rib domain (morphological opening spares the one-cell gradient
-    # cliffs of infilled separator strips — those must keep bridging).
+    # the rib domain — from the SMOOTHED gradients, so the cull contour is
+    # smooth instead of stair-stepped; morphological opening spares the
+    # one-cell gradient cliffs of infilled separator strips (those must
+    # keep bridging).
     from scipy.ndimage import binary_opening
-    gu_raw, gv_raw = np.gradient(D.astype(np.float32), cell)
-    steep = np.hypot(gu_raw, gv_raw) > math.tan(math.radians(55.0))
-    mask = inset_mask & ~binary_opening(steep, iterations=2)
+    Gu, Gv = make_gradients(D, cell)
+    steep = binary_opening(
+        np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
+    mask = inset_mask & ~steep
 
     segs = list(generate_segments(params, _lattice_window(params,
                                                           domain.bounds)))
@@ -579,10 +589,12 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     # rib-termination distance field measured from the FINAL domain (inset
     # boundary AND slope-cull rims): the -B clamp ends every rib on it
     B = (distance_transform_edt(mask) * cell).astype(np.float32)
-    Gu, Gv = make_gradients(D, cell)
+    # distance to cull rims ONLY, for the mandatory height fade there
+    C = (distance_transform_edt(~steep) * cell).astype(np.float32) \
+        if steep.any() else None
 
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv)
+                       Gu=Gu, Gv=Gv, C=C)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
     rep.warnings += warn
