@@ -30,6 +30,9 @@ class FrameGrids:
     Gv: np.ndarray = None       # smoothed clipped dD/dv
     Bo: np.ndarray = None       # distance to the OPEN boundary only
                                 # (taper ramp: cull rims must not fade it)
+    Sc: np.ndarray = None       # distance to the slope-cull band: ribs end
+                                # on a smooth offset of the band (ramp in
+                                # field()), not on the pixelated mask edge
     gate: np.ndarray = None     # (nlv, nu, nv) body-material lookup:
                                 # True where ribs/slab may exist at that
                                 # depth level (nTop-style body-field cut)
@@ -147,6 +150,12 @@ def field(u, v, d, grids, params):
     # (the prism clamp above cannot reach it), otherwise the sheet follows
     # the pixelated mask/coverage edge and frays at every recess rim
     f = np.maximum(f, 1.2 * np.float32(g.cell) - B)
+    # cull-band termination: a linear ramp against the (smooth) distance
+    # to the steep band ends every rib on a clean offset line ~1mm before
+    # the band — sampled at the foot, so leaning tops stay put
+    if g.Sc is not None:
+        sc = _bilinear(g.Sc, u, v, g.cell, g.origin)
+        f = np.maximum(f, np.float32(max(1.0, 0.75 * params.thickness)) - sc)
     # nTop-style body cut: material may only exist inside the body (or
     # within tolerance of its surface). Looked up at the sample's own 3D
     # position, so rib tops leaning past a lip terminate against the smooth
@@ -374,7 +383,7 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
         fc = f[lab[f[:, 0]] == cid]
         vol = np.einsum("ij,ij->i", v[fc[:, 0]],
                         np.cross(v[fc[:, 1]], v[fc[:, 2]])).sum() / 6.0
-        if abs(vol) < 1.0 or len(fc) < 24:
+        if abs(vol) < 8.0 or len(fc) < 24:
             continue
         keep.append(fc[:, ::-1] if vol < 0 else fc)
     if not keep:
@@ -615,34 +624,6 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
                                                           domain.bounds)))
     if params.border:
         segs += _ring_chains(inset, max(cell * 2, params.spacing / 6.0))
-    if steep.any():
-        # a retaining rib along every slope-cull rim: lattice ribs meet it
-        # at full height — fading them instead reads as melted stubs, and
-        # bare amputation as chewed ones. The final domain is dilated along
-        # the rim (by rib half-width + root blend) so the rim rib's own
-        # body survives inside it: undilated, its centerline sits ON the
-        # boundary and both the setback clamp and taper erase it.
-        from skimage import measure as _sk_measure, morphology as _sk_morph
-        from scipy.ndimage import binary_dilation
-        rim_px = np.zeros_like(mask)
-        for ct in _sk_measure.find_contours(steep.astype(np.float32), 0.5):
-            if len(ct) * cell < 10.0:
-                continue                    # skip speck contours
-            pts = ct * cell + origin
-            keep_every = max(1, int(2.0 / cell))
-            segs.append([tuple(q) for q in pts[::keep_every]])
-            ii = np.clip(np.rint(ct[:, 0]).astype(int), 0,
-                         mask.shape[0] - 1)
-            jj = np.clip(np.rint(ct[:, 1]).astype(int), 0,
-                         mask.shape[1] - 1)
-            rim_px[ii, jj] = True
-        r_px = int(math.ceil((params.thickness / 2.0
-                              + max(params.fillet_root, 0.0)) / cell)) + 2
-        # kept side only: ribs over culled steep cells stand on the
-        # plunging wall and shear into curled tabs at every rib end
-        strip = (binary_dilation(rim_px, structure=_sk_morph.disk(r_px))
-                 & inset_mask & ~steep)
-        mask = mask | strip
     reach = (params.thickness / 2.0
              + math.tan(math.radians(max(params.draft_deg, 0.0)))
              * (params.height + params.embed)
@@ -658,6 +639,16 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     # run-out ramp distance: to the OPEN boundary only (the inset polygon
     # edge) — rims are interior and must not fade the height
     Bo = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
+    # cull-band distance: ribs end on a smooth offset of the band. The
+    # band edge itself is pixelated and meanders with gradient noise, but
+    # its distance field is smooth — the ramp in field() terminates ribs
+    # on a clean perpendicular line ~1mm before the band. Gaussian-
+    # smoothing the field straightens the offset lines against the
+    # band's gradient-noise meander. Rim walls (chain-following
+    # extrusions) were tried here and read as chewed strips; the body
+    # gate + this ramp is the clean nTop-style answer.
+    from scipy.ndimage import gaussian_filter as _gf
+    Sc = _gf(distance_transform_edt(~steep), 6.0).astype(np.float32) * cell
 
     # --- nTop-style body gate -------------------------------------------
     # additive material is cut by the BODY's own field, not the pixelated
@@ -708,7 +699,7 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         f"{time.time() - t_gate:.0f}s")
 
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, Bo=Bo, gate=gate, gate_d0=g_d0,
+                       Gu=Gu, Gv=Gv, Bo=Bo, Sc=Sc, gate=gate, gate_d0=g_d0,
                        gate_dlv=g_dlv)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
