@@ -30,6 +30,11 @@ class FrameGrids:
     Gv: np.ndarray = None       # smoothed clipped dD/dv
     Bo: np.ndarray = None       # distance to the OPEN boundary only
                                 # (taper ramp: cull rims must not fade it)
+    gate: np.ndarray = None     # (nlv, nu, nv) body-material lookup:
+                                # True where ribs/slab may exist at that
+                                # depth level (nTop-style body-field cut)
+    gate_d0: float = 0.0        # frame depth of gate level 0
+    gate_dlv: float = 1.0       # level spacing
 
 
 def make_gradients(D, cell, max_slope=3.1):
@@ -99,9 +104,10 @@ def field(u, v, d, grids, params):
     if params.taper_len > 0 and not params.border:
         # the run-out ramp follows the OPEN boundary only: slope-cull rims
         # are interior transitions where retaining ribs meet lattice ribs
-        # at full height — fading there reads as melted stubs
+        # at full height — fading there reads as melted stubs. Sampled at
+        # the foot: the shifted point would wobble the ramp on slopes.
         Bo = g.B if g.Bo is None else g.Bo
-        open_d = _bilinear(Bo, fu, fv, g.cell, g.origin)
+        open_d = _bilinear(Bo, u, v, g.cell, g.origin)
         height = height * np.clip(open_d / params.taper_len, 0.0, 1.0)
 
     half = np.float32(params.thickness / 2.0)
@@ -141,11 +147,25 @@ def field(u, v, d, grids, params):
     # (the prism clamp above cannot reach it), otherwise the sheet follows
     # the pixelated mask/coverage edge and frays at every recess rim
     f = np.maximum(f, 1.2 * np.float32(g.cell) - B)
+    # nTop-style body cut: material may only exist inside the body (or
+    # within tolerance of its surface). Looked up at the sample's own 3D
+    # position, so rib tops leaning past a lip terminate against the smooth
+    # recess wall instead of being amputated at the pixelated mask edge.
+    if g.gate is not None:
+        gi = np.clip(((u - g.origin[0]) / g.cell).astype(np.int64), 0,
+                     g.gate.shape[1] - 1)
+        gj = np.clip(((v - g.origin[1]) / g.cell).astype(np.int64), 0,
+                     g.gate.shape[2] - 1)
+        gl = np.clip(((d - g.gate_d0) / g.gate_dlv).astype(np.int64), 0,
+                     g.gate.shape[0] - 1)
+        body_ok = g.gate[gl, gi, gj]
+    else:
+        body_ok = True
     # air must stay within a few voxels of zero: a 1e3 jump puts rim
     # crossings at t~0.001 — micron triangles that collapse into the
     # degenerate/duplicate faces manifold3d rejects
     air = np.float32(max(4.0 * g.cell, 0.6))
-    return np.where(inside, f.astype(np.float32), air)
+    return np.where(inside & body_ok, f.astype(np.float32), air)
 
 
 def _taubin(v, f, rounds=4, lam=0.5, mu=-0.53):
@@ -583,15 +603,13 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     Gu, Gv = make_gradients(D, cell)
     steep = binary_opening(
         np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
-    # cells whose front surface has no backing along the view ray: lips
-    # over recess floors (backmost surface far behind the frontmost) and
-    # open shadow (no back surface at all). The depth map is a heightfield
-    # of the FRONT surface, so ribs and the sub-surface slab built there
-    # float as free-standing plates with frayed edges. Narrow separator
-    # gaps have coinciding front/back depths and keep bridging.
-    unbacked = ((D - Dback) > max(2.0 * params.thickness, 3.0)) \
-        | (Dback > 1e8)
-    mask = inset_mask & ~steep & ~unbacked
+    # columns whose front surface is backed by material within a few mm
+    # along the view ray: the heightfield can be trusted there. Over
+    # recess floors and past the silhouette the front-most depth is a lip
+    # far in front of the true surface — handled by the body gate below.
+    backed = ((D - Dback) <= max(2.0 * params.thickness, 3.0)) \
+        & (Dback <= 1e8)
+    mask = inset_mask & ~steep
 
     segs = list(generate_segments(params, _lattice_window(params,
                                                           domain.bounds)))
@@ -623,7 +641,7 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         # kept side only: ribs over culled steep cells stand on the
         # plunging wall and shear into curled tabs at every rib end
         strip = (binary_dilation(rim_px, structure=_sk_morph.disk(r_px))
-                 & inset_mask & ~steep & ~unbacked)
+                 & inset_mask & ~steep)
         mask = mask | strip
     reach = (params.thickness / 2.0
              + math.tan(math.radians(max(params.draft_deg, 0.0)))
@@ -641,8 +659,57 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     # edge) — rims are interior and must not fade the height
     Bo = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
 
+    # --- nTop-style body gate -------------------------------------------
+    # additive material is cut by the BODY's own field, not the pixelated
+    # 2D domain: points in the void behind a lip (over recess floors, past
+    # the silhouette) are removed against the smooth recess wall, so ribs
+    # die into the body exactly like an implicit-modeler feature. Looked
+    # up as a body-interior test (fast-winding SDF <= tol) on depth
+    # levels, only over unbacked columns near the void boundary — deep
+    # void is cut outright and backed columns are always allowed.
+    tol = float(np.clip(0.25 * params.thickness, 0.2, 0.5))
+    g_d0 = -(params.embed + _slab_depth(params))
+    g_d1 = params.height
+    g_nlv = max(int(math.ceil((g_d1 - g_d0) / max(res, 0.4))) + 1, 2)
+    g_dlv = (g_d1 - g_d0) / (g_nlv - 1)
+    gate = np.zeros((g_nlv,) + shape2d, bool)
+    gate[:, backed] = True
+    from scipy.ndimage import distance_transform_edt as _edt
+    void_d = _edt(backed) * cell          # depth inside unbacked columns
+    band = 4.0
+    cand = (~backed) & (void_d <= band) & inset_mask
+    t_gate = time.time()
+    if cand.any():
+        import igl
+        from .meshing import mesh_shape
+        bm = mesh_shape(shape, 0.3, 0.3)
+        bv, bf, boff = [], [], 0
+        for m in bm:
+            bv.append(np.asarray(m.vertices, np.float64))
+            bf.append(np.asarray(m.triangles, np.int64) + boff)
+            boff += len(m.vertices)
+        BV = np.vstack(bv)
+        BF = np.vstack(bf)
+        ci, cj = np.nonzero(cand)
+        cu = ci * cell + origin[0]
+        cv = cj * cell + origin[1]
+        n_c = len(ci)
+        chunk = 1_500_000
+        for l in range(g_nlv):
+            dd = g_d0 + l * g_dlv
+            for s0 in range(0, n_c, chunk):
+                sl = slice(s0, min(s0 + chunk, n_c))
+                pts = ctr[None, :] + cu[sl, None] * axes[:, 0] \
+                    + cv[sl, None] * axes[:, 1] + dd * n_axis[None, :]
+                out = igl.signed_distance(np.ascontiguousarray(pts), BV, BF)
+                gate[l, ci[sl], cj[sl]] = out[0] <= tol
+    rep.warnings.append(
+        f"body gate: {int(cand.sum())} cols x {g_nlv} lv, "
+        f"{time.time() - t_gate:.0f}s")
+
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, Bo=Bo)
+                       Gu=Gu, Gv=Gv, Bo=Bo, gate=gate, gate_d0=g_d0,
+                       gate_dlv=g_dlv)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
     rep.warnings += warn
