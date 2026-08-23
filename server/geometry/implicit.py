@@ -24,11 +24,12 @@ class FrameGrids:
     origin: tuple               # (u0, v0) of grid[0, 0]
     D: np.ndarray               # front-most surface depth (position . n)
     P: np.ndarray               # 2D distance to rib centerlines
-    B: np.ndarray               # distance to the domain boundary (taper)
+    B: np.ndarray               # distance to the final rib-domain boundary
     mask: np.ndarray            # inside the closed, margin-inset domain
     Gu: np.ndarray = None       # smoothed clipped dD/du (slope correction)
     Gv: np.ndarray = None       # smoothed clipped dD/dv
-    C: np.ndarray = None        # distance to slope-cull rims (height fade)
+    Bo: np.ndarray = None       # distance to the OPEN boundary only
+                                # (taper ramp: cull rims must not fade it)
 
 
 def make_gradients(D, cell, max_slope=3.1):
@@ -96,13 +97,12 @@ def field(u, v, d, grids, params):
 
     height = np.float32(params.height)
     if params.taper_len > 0 and not params.border:
-        height = height * np.clip(B / params.taper_len, 0.0, 1.0)
-    if g.C is not None:
-        # ribs must die INTO the surface before a slope-cull rim — a
-        # full-height amputation at the cull line reads as chewed stubs.
-        # Border ribs are unaffected: this field ignores the outer boundary.
-        Cf = _bilinear(g.C, fu, fv, g.cell, g.origin)
-        height = height * np.clip(Cf / 3.0, 0.0, 1.0)
+        # the run-out ramp follows the OPEN boundary only: slope-cull rims
+        # are interior transitions where retaining ribs meet lattice ribs
+        # at full height — fading there reads as melted stubs
+        Bo = g.B if g.Bo is None else g.Bo
+        open_d = _bilinear(Bo, fu, fv, g.cell, g.origin)
+        height = height * np.clip(open_d / params.taper_len, 0.0, 1.0)
 
     half = np.float32(params.thickness / 2.0)
     if params.draft_deg > 0:
@@ -578,6 +578,31 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
                                                           domain.bounds)))
     if params.border:
         segs += _ring_chains(inset, max(cell * 2, params.spacing / 6.0))
+    if steep.any():
+        # a retaining rib along every slope-cull rim: lattice ribs meet it
+        # at full height — fading them instead reads as melted stubs, and
+        # bare amputation as chewed ones. The final domain is dilated along
+        # the rim (by rib half-width + root blend) so the rim rib's own
+        # body survives inside it: undilated, its centerline sits ON the
+        # boundary and both the setback clamp and taper erase it.
+        from skimage import measure as _sk_measure, morphology as _sk_morph
+        from scipy.ndimage import binary_dilation
+        rim_px = np.zeros_like(mask)
+        for ct in _sk_measure.find_contours(steep.astype(np.float32), 0.5):
+            if len(ct) * cell < 10.0:
+                continue                    # skip speck contours
+            pts = ct * cell + origin
+            keep_every = max(1, int(2.0 / cell))
+            segs.append([tuple(q) for q in pts[::keep_every]])
+            ii = np.clip(np.rint(ct[:, 0]).astype(int), 0,
+                         mask.shape[0] - 1)
+            jj = np.clip(np.rint(ct[:, 1]).astype(int), 0,
+                         mask.shape[1] - 1)
+            rim_px[ii, jj] = True
+        r_px = int(math.ceil((params.thickness / 2.0
+                              + max(params.fillet_root, 0.0)) / cell)) + 2
+        strip = binary_dilation(rim_px, structure=_sk_morph.disk(r_px))
+        mask = mask | (strip & inset_mask)
     reach = (params.thickness / 2.0
              + math.tan(math.radians(max(params.draft_deg, 0.0)))
              * (params.height + params.embed)
@@ -586,15 +611,16 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     P = _exact_pattern_distance(segs, cell, origin, shape2d, reach)
     if P.min() > reach:
         raise RibbingError("pattern produced no ribs on this region")
-    # rib-termination distance field measured from the FINAL domain (inset
-    # boundary AND slope-cull rims): the -B clamp ends every rib on it
+    # rib-termination distance measured from the FINAL domain (inset
+    # boundary, slope-cull rims and their dilated rim strips): the -B clamp
+    # ends every rib on it
     B = (distance_transform_edt(mask) * cell).astype(np.float32)
-    # distance to cull rims ONLY, for the mandatory height fade there
-    C = (distance_transform_edt(~steep) * cell).astype(np.float32) \
-        if steep.any() else None
+    # run-out ramp distance: to the OPEN boundary only (the inset polygon
+    # edge) — rims are interior and must not fade the height
+    Bo = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
 
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, C=C)
+                       Gu=Gu, Gv=Gv, Bo=Bo)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
     rep.warnings += warn

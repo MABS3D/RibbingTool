@@ -177,6 +177,42 @@ def test_pinch_repair_splits_shared_vertex():
                                      f2.astype(np.uint32))).is_empty()
 
 
+def test_retaining_rim_rib_survives_setback_and_taper():
+    # a slope-cull rim gets a retaining rib: it must (a) survive the
+    # 1.2-cell setback — the final mask is dilated along the rim, so B>0
+    # under its centerline — and (b) stand at FULL height even with taper,
+    # because the ramp follows distance to OPEN boundary (Bo), not to the
+    # cull rim. Fading or amputating here reads as melted/chewed stubs.
+    cell = CELL
+    nu, nv = 161, 121                       # 40 x 30 mm
+    steep = np.zeros((nu, nv), bool)
+    steep[119:122, :] = True                # cull band along u = 30
+    mask = ~steep                           # inset covers the whole grid
+    # final rib domain: mask dilated ~2mm along the rim (kept side)
+    final = mask.copy()
+    final[116:121, :] = True
+    rim_chain = [(30.0, float(j * cell)) for j in range(nv)]
+    from server.geometry.implicit import _exact_pattern_distance
+    P = _exact_pattern_distance([rim_chain], cell, (0.0, 0.0), (nu, nv),
+                                reach=4.0)
+    from scipy.ndimage import distance_transform_edt
+    g = FrameGrids(
+        cell=cell, origin=(0.0, 0.0),
+        D=np.full((nu, nv), 10.0, np.float32),
+        P=P.astype(np.float32),
+        B=(distance_transform_edt(final) * cell).astype(np.float32),
+        Bo=np.full((nu, nv), 1e6, np.float32),      # open boundary: far
+        mask=final)
+    p = _params(thickness=1.2, height=3.0, taper_len=10.0)
+    clusters = mesh_field(g, p, resolution=CELL)
+    assert _watertight(clusters)
+    v = np.vstack([c[0] for c in clusters])
+    m = np.abs(v[:, 0] - 30.0) < 1.5
+    assert m.any(), "no material within 1.5mm of the rim line"
+    rise = v[m, 2].max() - 10.0
+    assert rise > 0.8 * 3.0, f"rim rib melted to {rise:.2f}mm"
+
+
 def test_crossing_ribs_single_watertight_body():
     clusters = mesh_field(_grids(CROSS), _params(fillet_root=1.0),
                           resolution=CELL)
