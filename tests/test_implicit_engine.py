@@ -69,6 +69,22 @@ def test_fillet_root_adds_volume(box_step):
     assert v1 > v0 + 5.0
 
 
+def test_ribs_end_on_inset_boundary(box_step):
+    # ribs must terminate ON the true inset boundary, not on the pixelated
+    # mask edge (which reads as a serrated fringe at every rim)
+    s = load_step(box_step)
+    fid = biggest_face_id(s)
+    p = RibParams(pattern="isogrid", spacing=10, thickness=1.6, height=4,
+                  margin=3, taper_len=0, border=True, mapping="project")
+    clusters, _ = build_rib_implicit(s, [fid], p)
+    assert _watertight(clusters)
+    v = np.vstack([c[0] for c in clusters])
+    above = v[np.abs(v[:, 2]) > 0.4]           # rib material off the surface
+    # box face 60x40, margin 3: inset is [3,57]x[3,37]
+    assert above[:, 0].min() > 3.0 - 0.3 and above[:, 0].max() < 57.0 + 0.3
+    assert above[:, 1].min() > 3.0 - 0.3 and above[:, 1].max() < 37.0 + 0.3
+
+
 @pytest.mark.slow
 def test_band_acceptance(cruscotto_full_path):
     # the user's real workflow on the band pair, fillets on: one watertight

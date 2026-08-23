@@ -104,17 +104,77 @@ def test_taper_follows_boundary_ramp():
     assert v[:, 2].max() == pytest.approx(14.0, abs=0.3)   # full height hit
 
 
-def test_segment_clipping_preserves_direction():
-    # clamping instead of clipping used to redirect out-of-window diagonal
-    # family lines into false chords across the raster
-    from server.geometry.implicit import _clip_to_box
-    a, b = _clip_to_box(np.array([-50.0, 30.0]), np.array([150.0, 90.0]),
-                        100.0, 100.0)
+def test_slope_ribs_extrude_along_surface_normal():
+    # on a 30-degree slope the rib must stand on the LOCAL normal: its top
+    # then sits height/cos(30) above the depth map along the view axis.
+    # Uncorrected (view-axis) extrusion gives exactly height -> leaning
+    # blades with knife tops on every slope.
+    g = _grids(lambda uu, vv: np.abs(vv - 15.0))       # rib along u
+    nu = g.D.shape[0]
+    slope = np.tan(np.radians(30.0))
+    g.D = (10.0 + (np.arange(nu, dtype=np.float32) * CELL * slope)[:, None]
+           * np.ones_like(g.D)).astype(np.float32)
+    from server.geometry.implicit import make_gradients
+    g.Gu, g.Gv = make_gradients(g.D, CELL)
+    p = _params()
+    clusters = mesh_field(g, p, resolution=CELL)
+    assert _watertight(clusters)
+    v = np.vstack([c[0] for c in clusters])
+    m = (np.abs(v[:, 1] - 15.0) < 0.8) & (v[:, 0] > 8) & (v[:, 0] < 32)
+    rise = v[m, 2] - (10.0 + v[m, 0] * slope)          # above local surface
+    expected = 4.0 / np.cos(np.radians(30.0))          # 4.62
+    assert rise.max() == pytest.approx(expected, abs=0.25)
+
+
+def test_exact_segment_distance_subvoxel():
+    # EDT of a rasterized staircase scallops by ~cell/2 — walls ripple and
+    # border ridges crenellate. Exact band distance must be sub-voxel true.
+    from server.geometry.implicit import _exact_pattern_distance
+    seg = [[(3.0, 2.0), (36.0, 27.0)]]                 # diagonal polyline
+    P = _exact_pattern_distance(seg, cell=0.25, origin=(0.0, 0.0),
+                                shape2d=(161, 121), reach=4.0)
+    a = np.array([3.0, 2.0]); b = np.array([36.0, 27.0])
     d = (b - a) / np.linalg.norm(b - a)
-    assert d[1] / d[0] == pytest.approx(60.0 / 200.0, abs=1e-9)
-    assert a[0] == pytest.approx(0.0) and b[0] == pytest.approx(100.0)
-    assert _clip_to_box(np.array([-10.0, -10.0]), np.array([-1.0, 50.0]),
-                        100.0, 100.0) is None
+    rng = np.random.default_rng(3)
+    for _ in range(60):
+        t = rng.uniform(0.1, 0.9)
+        off = rng.uniform(-3.0, 3.0)
+        q = a + t * (b - a) + off * np.array([-d[1], d[0]])
+        i, j = int(round(q[0] / 0.25)), int(round(q[1] / 0.25))
+        grid_err = abs(P[i, j] - abs(off))
+        assert grid_err < 0.19, f"{grid_err} at offset {off}"
+
+
+def test_micro_hole_filling_restores_manifold():
+    import manifold3d as m3d
+    from server.geometry.implicit import _fill_microholes
+    # unit cube as 12 triangles with ONE removed -> open 3-edge hole
+    v = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+                  [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], np.float64)
+    f = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                  [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
+                  [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]], np.int64)
+    f_holed = f[:-1]
+    assert m3d.Manifold(m3d.Mesh(v.astype(np.float32),
+                                 f_holed.astype(np.uint32))).is_empty()
+    v2, f2 = _fill_microholes(v, f_holed)
+    assert not m3d.Manifold(m3d.Mesh(v2.astype(np.float32),
+                                     f2.astype(np.uint32))).is_empty()
+
+
+def test_pinch_repair_splits_shared_vertex():
+    # two tetrahedra sharing exactly one vertex: manifold3d rejects the
+    # pinch, and a rejected lattice silently drops out of export unions
+    import manifold3d as m3d
+    from server.geometry.implicit import _repair_pinches
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                  [-1, 0, 0], [0, -1, 0], [0, 0, -1]], np.float64)
+    f = np.array([[0, 2, 1], [0, 3, 2], [0, 1, 3], [1, 2, 3],
+                  [0, 4, 5], [0, 6, 4], [0, 5, 6], [4, 6, 5]], np.int64)
+    v2, f2 = _repair_pinches(v, f)
+    assert len(v2) == 8                      # pinch vertex duplicated
+    assert not m3d.Manifold(m3d.Mesh(v2.astype(np.float32),
+                                     f2.astype(np.uint32))).is_empty()
 
 
 def test_crossing_ribs_single_watertight_body():

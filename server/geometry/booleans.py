@@ -198,24 +198,40 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
     except BooleanError:
         pass
     rib_mans = []
+    raw_shells = []
     for s in rib_solids:
         try:
             if isinstance(s, tuple):
                 v, f = s   # watertight cluster mesh, indices already shared
-                rib_mans.append(m3d.Manifold(
-                    m3d.Mesh(np.ascontiguousarray(v, np.float32),
-                             np.ascontiguousarray(f, np.uint32))))
+                mesh = m3d.Mesh(np.ascontiguousarray(v, np.float32),
+                                np.ascontiguousarray(f, np.uint32))
+                man = m3d.Manifold(mesh)
+                if man.is_empty():
+                    # implicit-engine meshes can carry marching-cubes
+                    # micro-cracks; merge() sews exact-coincidence cases
+                    try:
+                        mesh.merge()
+                        man = m3d.Manifold(mesh)
+                    except Exception:
+                        pass
+                if man.is_empty():
+                    # never drop geometry: export the lattice as its own
+                    # shell — slicers merge overlapping shells natively
+                    raw_shells.append((np.asarray(v, np.float64),
+                                       np.asarray(f, np.int64)))
+                    continue
+                rib_mans.append(man)
             else:
                 rib_mans.append(_to_manifold(s, lin_defl))
         except Exception:
             continue
-    if not rib_mans and body_man is None:
+    if not rib_mans and body_man is None and not raw_shells:
         raise BooleanError("no meshable geometry to union")
 
     if body_man is not None:
         man = m3d.Manifold.batch_boolean([body_man] + rib_mans, m3d.OpType.Add)
         if not man.is_empty():
-            return [_man_to_arrays(man, simplify_tol)]
+            return [_man_to_arrays(man, simplify_tol)] + raw_shells
 
     shells = []
     v, f = _weld(*_shape_to_mesh(body_shape, lin_defl))
@@ -227,7 +243,7 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
         else:
             for rm in rib_mans:
                 shells.append(_man_to_arrays(rm, None))
-    return shells
+    return shells + raw_shells
 
 
 def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.5,

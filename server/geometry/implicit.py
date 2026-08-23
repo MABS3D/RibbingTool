@@ -26,6 +26,22 @@ class FrameGrids:
     P: np.ndarray               # 2D distance to rib centerlines
     B: np.ndarray               # distance to the domain boundary (taper)
     mask: np.ndarray            # inside the closed, margin-inset domain
+    Gu: np.ndarray = None       # smoothed clipped dD/du (slope correction)
+    Gv: np.ndarray = None       # smoothed clipped dD/dv
+
+
+def make_gradients(D, cell, max_slope=3.1):
+    """Depth-map gradients for surface-normal rib extrusion.
+
+    Clipped to the kept-filter slope (~72 deg) so infilled separator steps
+    cannot spike them, then smoothed so marching cubes sees a stable frame.
+    """
+    from scipy.ndimage import gaussian_filter
+    Gu, Gv = np.gradient(D.astype(np.float32), cell)
+    m = np.hypot(Gu, Gv)
+    scale = np.where(m > max_slope, max_slope / np.clip(m, 1e-9, None), 1.0)
+    return (gaussian_filter(Gu * scale, 2.0).astype(np.float32),
+            gaussian_filter(Gv * scale, 2.0).astype(np.float32))
 
 
 def _bilinear(grid, u, v, cell, origin):
@@ -42,15 +58,34 @@ def _bilinear(grid, u, v, cell, origin):
 
 
 def _slab_depth(params):
-    return params.embed + max(params.fillet_root, 0.0) + 0.6
+    # just deep enough to seal rib bases into the body: the smooth-min
+    # blend bulge lives ABOVE the surface, so k must NOT deepen the slab —
+    # at fillet_root 2 it punched through 2.5mm walls and freckled the back
+    return params.embed + 0.6
 
 
 def field(u, v, d, grids, params):
     """Signed field (negative = material) at frame-space points (u, v, d)."""
     g = grids
     D = _bilinear(g.D, u, v, g.cell, g.origin)
-    P = _bilinear(g.P, u, v, g.cell, g.origin)
-    inside = _bilinear(g.mask.astype(np.float32), u, v, g.cell,
+    # ribs stand on the LOCAL surface normal, not the view axis: without
+    # this, slopes grow leaning blades with knife tops and lose height.
+    # First-order heightfield correction: s = true normal distance, and
+    # laterals are sampled at the normal ray's foot point.
+    if g.Gu is not None:
+        Du = _bilinear(g.Gu, u, v, g.cell, g.origin)
+        Dv = _bilinear(g.Gv, u, v, g.cell, g.origin)
+        c = 1.0 / np.sqrt(1.0 + Du * Du + Dv * Dv)
+        s = (d - D) * c
+        fu = u + s * Du * c
+        fv = v + s * Dv * c
+    else:
+        c = 1.0
+        s = d - D
+        fu, fv = u, v
+    P = _bilinear(g.P, fu, fv, g.cell, g.origin)
+    B = _bilinear(g.B, fu, fv, g.cell, g.origin)
+    inside = _bilinear(g.mask.astype(np.float32), fu, fv, g.cell,
                        g.origin) > 0.5
     # beyond the raster there is no surface: cap the field as air there,
     # or marching cubes leaves open sheets at the sampling box walls
@@ -60,29 +95,33 @@ def field(u, v, d, grids, params):
 
     height = np.float32(params.height)
     if params.taper_len > 0 and not params.border:
-        B = _bilinear(g.B, u, v, g.cell, g.origin)
         height = height * np.clip(B / params.taper_len, 0.0, 1.0)
-    top = D + height
 
     half = np.float32(params.thickness / 2.0)
     if params.draft_deg > 0:
         half = half + math.tan(math.radians(params.draft_deg)) \
-            * np.clip(top - d, 0.0, None)
+            * np.clip(height - s, 0.0, None)
 
     wall = P - half
     r_top = float(np.clip(params.fillet_top, 0.0, 0.35 * params.thickness))
     if r_top > 0:
         # rounded corner between wall and top plane
         a = wall + r_top
-        b = (d - top) + r_top
+        b = (s - height) + r_top
         prism = (np.minimum(np.maximum(a, b), 0.0)
                  + np.hypot(np.clip(a, 0.0, None), np.clip(b, 0.0, None))
                  - r_top)
     else:
-        prism = np.maximum(wall, d - top)
-    prism = np.maximum(prism, (D - params.embed) - d)
+        prism = np.maximum(wall, s - height)
+    prism = np.maximum(prism, -s - params.embed)
+    # ribs end ON the true domain boundary (B is its distance field), not
+    # on the pixelated mask edge — cut mask cells read as a serrated
+    # fringe. The 1.2-cell setback suppresses sub-voxel slivers at cull
+    # rims (they surfaced as flakes stuck to steep walls); border rib
+    # centerlines sit at B=0, so borders become flush walls.
+    prism = np.maximum(prism, 1.2 * np.float32(g.cell) - B)
 
-    shell = d - (D - _SINK)             # body half-space, sunk out of view
+    shell = s + _SINK                   # body half-space, sunk out of view
     k = float(max(params.fillet_root, 0.0))
     if k > 0:
         h = np.clip(0.5 + 0.5 * (shell - prism) / k, 0.0, 1.0)
@@ -90,8 +129,12 @@ def field(u, v, d, grids, params):
     else:
         f = np.minimum(prism, shell)
 
-    f = np.maximum(f, (D - _slab_depth(params)) - d)     # slab floor cap
-    return np.where(inside, f.astype(np.float32), _AIR)
+    f = np.maximum(f, -s - _slab_depth(params))          # slab floor cap
+    # air must stay within a few voxels of zero: a 1e3 jump puts rim
+    # crossings at t~0.001 — micron triangles that collapse into the
+    # degenerate/duplicate faces manifold3d rejects
+    air = np.float32(max(4.0 * g.cell, 0.6))
+    return np.where(inside, f.astype(np.float32), air)
 
 
 def _taubin(v, f, rounds=4, lam=0.5, mu=-0.53):
@@ -110,6 +153,89 @@ def _taubin(v, f, rounds=4, lam=0.5, mu=-0.53):
         v = v + lam * (L @ v - v)
         v = v + mu * (L @ v - v)
     return v
+
+
+def _fill_microholes(v, f, max_edges=250):
+    """Fan-fill small boundary loops (marching-cubes micro-holes).
+
+    Sub-voxel cracks survive welding when the two sides genuinely differ;
+    at 0.02% of edges the standard repair is to patch them. The cap keeps
+    a genuinely missing region visible instead of papering it over —
+    crack loops are long thin slivers well under it.
+    """
+    import igl
+    e = np.sort(np.vstack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]),
+                axis=1)
+    _, counts = np.unique(e, axis=0, return_counts=True)
+    if not (counts == 1).any():
+        return v, f
+    loops = igl.boundary_loop_all(np.asarray(f, np.int64))
+    add_v, add_f = [], []
+    nid = len(v)
+    for loop in loops:
+        loop = np.asarray(loop, np.int64)
+        if len(loop) < 3 or len(loop) > max_edges:
+            continue
+        add_v.append(v[loop].mean(axis=0))
+        for i in range(len(loop)):
+            # fan winding must oppose the loop direction so patch normals
+            # agree with the surrounding surface
+            add_f.append((nid, loop[(i + 1) % len(loop)], loop[i]))
+        nid += 1
+    if not add_v:
+        return v, f
+    return (np.vstack([v, np.asarray(add_v)]),
+            np.vstack([f, np.asarray(add_f, f.dtype)]))
+
+
+def _repair_pinches(v, f):
+    """Split marching-cubes pinch vertices (two closed fans sharing one
+    vertex). manifold3d strictly rejects them, and a rejected lattice
+    silently drops out of the export union."""
+    import igl
+    from collections import defaultdict
+    ok = np.asarray(igl.is_vertex_manifold(f.astype(np.int64))).ravel()
+    bad = set(map(int, np.nonzero(~ok)[0]))
+    if not bad:
+        return v, f
+    f = f.copy()
+    inc = defaultdict(list)
+    for fi, tri in enumerate(f):
+        for a in tri:
+            if int(a) in bad:
+                inc[int(a)].append(fi)
+    add = []
+    nid = len(v)
+    for vid, fis in inc.items():
+        parent = {fi: fi for fi in fis}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        by_other = defaultdict(list)
+        for fi in fis:
+            for o in f[fi]:
+                if int(o) != vid:
+                    by_other[int(o)].append(fi)
+        for fl in by_other.values():
+            for a, b in zip(fl[:-1], fl[1:]):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+        fans = defaultdict(list)
+        for fi in fis:
+            fans[find(fi)].append(fi)
+        for comp in list(fans.values())[1:]:
+            for fi in comp:
+                f[fi] = np.where(f[fi] == vid, nid, f[fi])
+            add.append(v[vid])
+            nid += 1
+    if add:
+        v = np.vstack([v, np.asarray(add)])
+    return v, f
 
 
 def _weld(verts, faces, tol=1e-5):
@@ -148,8 +274,14 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
         tb = min(ta + tile, iu1)
         for tc in range(iv0, iv1, tile):
             td = min(tc + tile, iv1)
-            us = np.arange(ta, tb + 1) * res
-            vs = np.arange(tc, td + 1) * res
+            # one-cell overlap: neighbors evaluate the shared cells from
+            # identical samples and produce identical triangles; each
+            # triangle is kept by the tile owning its centroid, so tile
+            # joints cannot crack (naked abutment relied on lewiner's
+            # boundary-cell triangulation matching — empirically it does
+            # not, and the mesh leaked thousands of micro-cracks)
+            us = np.arange(ta - 1, tb + 2) * res
+            vs = np.arange(tc - 1, td + 2) * res
             # depth band from the tile's masked surface cells
             ci0 = np.clip(((us[0] - u_lo) / g.cell).astype(int), 0, nu - 1)
             ci1 = np.clip(int((us[-1] - u_lo) / g.cell) + 2, 1, nu)
@@ -159,8 +291,17 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
             if not m.any():
                 continue
             Dt = g.D[ci0:ci1, cj0:cj1][m]
-            d0 = int(math.floor((Dt.min() - pad) / res))
-            d1 = int(math.ceil((Dt.max() + top_pad) / res))
+            # normal-extruded ribs on slopes reach height/cos(theta) along
+            # the view axis: stretch this tile's band by its local slope.
+            # Full-resolution max — a subsampled estimate once let a rib
+            # poke through the band top, leaving an open sheet.
+            scale = 1.0
+            if g.Gu is not None:
+                gm = float(np.hypot(g.Gu[ci0:ci1, cj0:cj1],
+                                    g.Gv[ci0:ci1, cj0:cj1]).max())
+                scale = math.sqrt(1.0 + gm * gm)
+            d0 = int(math.floor((Dt.min() - pad * scale) / res))
+            d1 = int(math.ceil((Dt.max() + top_pad * scale) / res))
             ds = np.arange(d0, d1 + 1) * res
             U, V, W = np.meshgrid(us, vs, ds, indexing="ij")
             vol = field(U.ravel(), V.ravel(), W.ravel(), g, params) \
@@ -170,6 +311,16 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
             verts, faces, _, _ = measure.marching_cubes(
                 vol, 0.0, spacing=(res, res, res))
             verts += (us[0], vs[0], ds[0])
+            cen = verts[faces].mean(axis=1)
+            lo_u = -np.inf if ta == iu0 else ta * res
+            hi_u = np.inf if tb >= iu1 else tb * res
+            lo_v = -np.inf if tc == iv0 else tc * res
+            hi_v = np.inf if td >= iv1 else td * res
+            own = ((cen[:, 0] >= lo_u) & (cen[:, 0] < hi_u)
+                   & (cen[:, 1] >= lo_v) & (cen[:, 1] < hi_v))
+            faces = faces[own]
+            if not len(faces):
+                continue
             all_v.append(verts)
             all_f.append(faces + off)
             off += len(verts)
@@ -178,15 +329,40 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
         return []
     v, f = _weld(np.vstack(all_v).astype(np.float64), np.vstack(all_f))
     v = _taubin(v, f)
-    signed = np.einsum("ij,ij->i", v[f[:, 0]],
-                       np.cross(v[f[:, 1]], v[f[:, 2]])).sum() / 6.0
-    if signed < 0:
-        f = f[:, ::-1]
+    # per-component: drop marching-cubes crumbs (isolated slivers at steep
+    # rims), orient each body outward by its own signed volume
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+    adj = sp.csr_matrix((np.ones(len(f) * 3, np.int8),
+                         (np.concatenate([f[:, 0], f[:, 1], f[:, 2]]),
+                          np.concatenate([f[:, 1], f[:, 2], f[:, 0]]))),
+                        shape=(len(v), len(v)))
+    _, lab = connected_components(adj, directed=False)
+    keep = []
+    for cid in np.unique(lab[f[:, 0]]):
+        fc = f[lab[f[:, 0]] == cid]
+        vol = np.einsum("ij,ij->i", v[fc[:, 0]],
+                        np.cross(v[fc[:, 1]], v[fc[:, 2]])).sum() / 6.0
+        if abs(vol) < 1.0 or len(fc) < 24:
+            continue
+        keep.append(fc[:, ::-1] if vol < 0 else fc)
+    if not keep:
+        return []
+    f = np.vstack(keep)
+    # pinches first: boundary loops through pinched vertices cannot be
+    # walked, so holes must be filled on the split mesh
+    v, f = _repair_pinches(v, f)
+    v, f = _fill_microholes(v, f)
     if reports is not None:
         import manifold3d as m3d
-        man = m3d.Manifold(m3d.Mesh(v.astype(np.float32),
-                                    f.astype(np.uint32)))
-        if man.is_empty():
+        mesh = m3d.Mesh(v.astype(np.float32), f.astype(np.uint32))
+        # marching cubes leaves micro-cracks at tile planes and mask rims;
+        # manifold3d's native merge() sews this exact defect class
+        try:
+            mesh.merge()
+        except Exception:
+            pass
+        if m3d.Manifold(mesh).is_empty():
             reports.append("implicit mesh failed manifold validation")
     return [(v, f.astype(np.int64))]
 
@@ -243,47 +419,41 @@ def _rasterize_rings(geom, cell, origin, shape2d):
     return mask
 
 
-def _clip_to_box(q0, q1, hi0, hi1):
-    """Liang-Barsky clip of segment q0-q1 to [0,hi0]x[0,hi1]; None if out."""
-    d = q1 - q0
-    t0, t1 = 0.0, 1.0
-    for axis, hi in ((0, hi0), (1, hi1)):
-        for p, q in ((-d[axis], q0[axis]), (d[axis], hi - q0[axis])):
-            if abs(p) < 1e-12:
-                if q < 0:
-                    return None
-                continue
-            t = q / p
-            if p < 0:
-                t0 = max(t0, t)
-            else:
-                t1 = min(t1, t)
-            if t0 > t1:
-                return None
-    return q0 + t0 * d, q0 + t0 * d + (t1 - t0) * d
+def _exact_pattern_distance(segs, cell, origin, shape2d, reach):
+    """Exact 2D distance to the centerline network, within `reach` of it.
 
-
-def _rasterize_segments(segs, cell, origin, shape2d):
-    """Boolean raster of the rib centerline network.
-
-    Segments are clipped to the raster box parametrically — clamping their
-    endpoints instead would redirect out-of-window family lines into false
-    chords across the pattern.
+    Rasterized-centerline EDT scallops walls by ~cell/2 (stair-step chains),
+    which reads as rippled rib walls and crenellated border ridges. Exact
+    point-to-segment distance in a band around each piece is sub-voxel true;
+    beyond every band the field is just air, so 1e3 is fine there.
     """
-    from skimage.draw import line as sk_line
-    mask = np.zeros(shape2d, bool)
-    hi0, hi1 = shape2d[0] - 1, shape2d[1] - 1
+    P = np.full(shape2d, 1e3, np.float32)
+    pad = reach / cell
     for s in segs:
         pts = (np.asarray(s, float) - origin) / cell
         for q0, q1 in zip(pts[:-1], pts[1:]):
-            hit = _clip_to_box(q0, q1, hi0, hi1)
-            if hit is None:
+            i0 = max(int(math.floor(min(q0[0], q1[0]) - pad)), 0)
+            i1 = min(int(math.ceil(max(q0[0], q1[0]) + pad)) + 1, shape2d[0])
+            j0 = max(int(math.floor(min(q0[1], q1[1]) - pad)), 0)
+            j1 = min(int(math.ceil(max(q0[1], q1[1]) + pad)) + 1, shape2d[1])
+            if i1 <= i0 or j1 <= j0:
                 continue
-            a, b = hit
-            rr, cc = sk_line(int(round(a[0])), int(round(a[1])),
-                             int(round(b[0])), int(round(b[1])))
-            mask[rr, cc] = True
-    return mask
+            gi = np.arange(i0, i1, dtype=np.float32)[:, None]
+            gj = np.arange(j0, j1, dtype=np.float32)[None, :]
+            e = q1 - q0
+            L2 = float(e @ e)
+            if L2 < 1e-12:
+                dx = gi - q0[0]
+                dy = gj - q0[1]
+            else:
+                t = np.clip(((gi - q0[0]) * e[0] + (gj - q0[1]) * e[1]) / L2,
+                            0.0, 1.0)
+                dx = gi - (q0[0] + t * e[0])
+                dy = gj - (q0[1] + t * e[1])
+            sub = P[i0:i1, j0:j1]
+            np.copyto(sub, np.minimum(sub,
+                                      np.sqrt(dx * dx + dy * dy) * cell))
+    return P
 
 
 def _ring_chains(geom, step):
@@ -376,26 +546,43 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     D = _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d)
     inset_mask = _rasterize_rings(inset, cell, origin, shape2d)
     covered = D > -1e8
-    holes = inset_mask & ~covered
-    if holes.any():
-        # sealed separator strips have no surface of their own: borrow the
-        # nearest flank's depth so ribs bridge them (same jog the fast
-        # engine's clamp produces)
+    if not covered.any():
+        raise RibbingError("selection is edge-on to the projection plane")
+    if (~covered).any():
+        # sealed separator strips borrow the nearest flank's depth so ribs
+        # bridge them; filling EVERY uncovered cell (not just domain holes)
+        # keeps the depth gradients finite — a -1e9 cliff at the domain
+        # edge turns into inf*0 = NaN and the gaussian smears it inward
         _, (ri, ci) = distance_transform_edt(~covered, return_indices=True)
-        D[holes] = D[ri[holes], ci[holes]]
-    mask = inset_mask
+        D[~covered] = D[ri[~covered], ci[~covered]]
+    # a heightfield with first-order normal correction cannot represent
+    # near-cull walls: past ~55 deg the ribs shred. Cull steep BANDS from
+    # the rib domain (morphological opening spares the one-cell gradient
+    # cliffs of infilled separator strips — those must keep bridging).
+    from scipy.ndimage import binary_opening
+    gu_raw, gv_raw = np.gradient(D.astype(np.float32), cell)
+    steep = np.hypot(gu_raw, gv_raw) > math.tan(math.radians(55.0))
+    mask = inset_mask & ~binary_opening(steep, iterations=2)
 
     segs = list(generate_segments(params, _lattice_window(params,
                                                           domain.bounds)))
     if params.border:
         segs += _ring_chains(inset, max(cell * 2, params.spacing / 6.0))
-    center = _rasterize_segments(segs, cell, origin, shape2d)
-    if not center.any():
+    reach = (params.thickness / 2.0
+             + math.tan(math.radians(max(params.draft_deg, 0.0)))
+             * (params.height + params.embed)
+             + max(params.fillet_root, 0.0)
+             + 0.35 * params.thickness + 2.0)
+    P = _exact_pattern_distance(segs, cell, origin, shape2d, reach)
+    if P.min() > reach:
         raise RibbingError("pattern produced no ribs on this region")
-    P = (distance_transform_edt(~center) * cell).astype(np.float32)
-    B = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
+    # rib-termination distance field measured from the FINAL domain (inset
+    # boundary AND slope-cull rims): the -B clamp ends every rib on it
+    B = (distance_transform_edt(mask) * cell).astype(np.float32)
+    Gu, Gv = make_gradients(D, cell)
 
-    grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask)
+    grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
+                       Gu=Gu, Gv=Gv)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
     rep.warnings += warn
