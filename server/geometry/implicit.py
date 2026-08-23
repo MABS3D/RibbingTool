@@ -137,6 +137,10 @@ def field(u, v, d, grids, params):
         f = np.minimum(prism, shell)
 
     f = np.maximum(f, -s - _slab_depth(params))          # slab floor cap
+    # the slab must end on the domain boundary too: applied after the cap
+    # (the prism clamp above cannot reach it), otherwise the sheet follows
+    # the pixelated mask/coverage edge and frays at every recess rim
+    f = np.maximum(f, 1.2 * np.float32(g.cell) - B)
     # air must stay within a few voxels of zero: a 1e3 jump puts rim
     # crossings at t~0.001 — micron triangles that collapse into the
     # degenerate/duplicate faces manifold3d rejects
@@ -376,9 +380,11 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
 
 # --- stage 1: pattern-space rasters from real geometry ----------------------
 
-def _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d):
-    """Front-most surface depth per cell from the kept projected triangles."""
-    D = np.full(shape2d, -1e9, np.float32)
+def _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d,
+                     backmost=False):
+    """Front-most (or back-most) surface depth per cell from the kept
+    projected triangles."""
+    D = np.full(shape2d, -1e9 if not backmost else 1e9, np.float32)
     u0, v0 = origin
     for a, b, c in tris[kept]:
         p = (np.array([flat[a], flat[b], flat[c]]) - (u0, v0)) / cell
@@ -406,7 +412,10 @@ def _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d):
             continue
         dval = (w0 * dz[0] + w1 * dz[1] + w2 * dz[2]).astype(np.float32)
         sub = D[i0:i1, j0:j1]
-        np.copyto(sub, np.maximum(sub, np.where(inside, dval, -1e9)))
+        if backmost:
+            np.copyto(sub, np.minimum(sub, np.where(inside, dval, 1e9)))
+        else:
+            np.copyto(sub, np.maximum(sub, np.where(inside, dval, -1e9)))
     return D
 
 
@@ -551,6 +560,8 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
                int((maxy - origin[1]) / cell) + 3)
 
     D = _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d)
+    Dback = _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d,
+                             backmost=True)
     inset_mask = _rasterize_rings(inset, cell, origin, shape2d)
     covered = D > -1e8
     if not covered.any():
@@ -572,7 +583,15 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     Gu, Gv = make_gradients(D, cell)
     steep = binary_opening(
         np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
-    mask = inset_mask & ~steep
+    # cells whose front surface has no backing along the view ray: lips
+    # over recess floors (backmost surface far behind the frontmost) and
+    # open shadow (no back surface at all). The depth map is a heightfield
+    # of the FRONT surface, so ribs and the sub-surface slab built there
+    # float as free-standing plates with frayed edges. Narrow separator
+    # gaps have coinciding front/back depths and keep bridging.
+    unbacked = ((D - Dback) > max(2.0 * params.thickness, 3.0)) \
+        | (Dback > 1e8)
+    mask = inset_mask & ~steep & ~unbacked
 
     segs = list(generate_segments(params, _lattice_window(params,
                                                           domain.bounds)))
@@ -601,8 +620,11 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
             rim_px[ii, jj] = True
         r_px = int(math.ceil((params.thickness / 2.0
                               + max(params.fillet_root, 0.0)) / cell)) + 2
-        strip = binary_dilation(rim_px, structure=_sk_morph.disk(r_px))
-        mask = mask | (strip & inset_mask)
+        # kept side only: ribs over culled steep cells stand on the
+        # plunging wall and shear into curled tabs at every rib end
+        strip = (binary_dilation(rim_px, structure=_sk_morph.disk(r_px))
+                 & inset_mask & ~steep & ~unbacked)
+        mask = mask | strip
     reach = (params.thickness / 2.0
              + math.tan(math.radians(max(params.draft_deg, 0.0)))
              * (params.height + params.embed)
