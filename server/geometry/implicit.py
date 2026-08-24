@@ -1,11 +1,27 @@
-"""Implicit (SDF) rib engine: one scalar field, meshed once.
+"""Implicit (SDF) rib engine: surface-field substrate, one scalar field.
 
-Ribs, root blends, crowns, taper and draft compose as field math in the
-projection frame; the boolean with the body is a smooth-min, so every
-rib-rib and rib-body junction blends uniformly and cannot fail.  The field
-is evaluated tile by tile on ONE global voxel grid (absolute multiples of
-the resolution on all three axes), so marching-cubes output from adjacent
-tiles welds exactly at shared planes.
+The substrate is the exact distance field of the SELECTED surface mesh:
+every voxel queries the closest point on the selection (igl BVH), so the
+height coordinate s is the TRUE signed distance along the local surface
+normal — on flat faces, steep walls and overhangs alike.  The 2D pattern
+rasters are sampled at that closest point (a closest-point surface
+field, the nTop "thickening" construction), so rib width is constant in
+surface coordinates on any slope and no slope cull exists: every
+selected face gets ribbed.  Ribs, root blends, crowns, taper and draft
+compose as field math; the boolean with the body is a smooth-min, so
+every rib-rib and rib-body junction blends uniformly and cannot fail.
+The field is evaluated tile by tile on ONE global voxel grid (absolute
+multiples of the resolution on all three axes), so marching-cubes
+output from adjacent tiles welds exactly at shared planes.  Evaluation
+is narrowed to a band around the surface by per-column padded depth
+bounds (an OpenVDB-style narrow band, built from conservative
+per-triangle projected bounding boxes so wall columns inherit their
+wall's full depth extent).
+
+Sign convention: s is signed by dot(x - cp, n(cp)) with angle-weighted
+vertex pseudo-normals (Baerentzen) — the exact first-order signed
+distance on smooth patches, valid on open meshes without any
+watertightness assumption.
 """
 import math
 import time
@@ -13,59 +29,113 @@ from dataclasses import dataclass
 
 import numpy as np
 
-_AIR = np.float32(1e3)          # field value outside the domain
 _SINK = 0.05                    # slab top sits this far under the surface
 
 
 @dataclass
-class FrameGrids:
-    """Pattern-space rasters, all (nu, nv), indexed [u, v]."""
-    cell: float                 # grid pitch (mm)
-    origin: tuple               # (u0, v0) of grid[0, 0]
-    D: np.ndarray               # front-most surface depth (position . n)
+class SurfaceField:
+    """Pattern-space rasters + substrate mesh, all in the frame.
+
+    The rasters are pure 2D PATTERN DATA (centerline distance, domain
+    boundary distance, domain mask); geometry comes from the substrate
+    mesh via exact closest-point queries.  Rasters are indexed [u, v].
+    """
+    cell: float                 # raster pitch (mm)
+    origin: tuple               # (u0, v0) of raster[0, 0]
     P: np.ndarray               # 2D distance to rib centerlines
     B: np.ndarray               # distance to the final rib-domain boundary
     mask: np.ndarray            # inside the closed, margin-inset domain
-    Gu: np.ndarray = None       # smoothed clipped dD/du (slope correction)
-    Gv: np.ndarray = None       # smoothed clipped dD/dv
-    Gm: np.ndarray = None       # gradient magnitude: the correction fades
-                                # to vertical as slope nears the cull, so
-                                # ribs on transition walls cannot fold
-    Bo: np.ndarray = None       # distance to the OPEN boundary only
-                                # (taper ramp: cull rims must not fade it)
-    Sc: np.ndarray = None       # distance to the slope-cull band: ribs end
-                                # on a smooth offset of the band (ramp in
-                                # field()), not on the pixelated mask edge
-    Ds: np.ndarray = None       # gaussian-smoothed depth: rib TOPS follow
-                                # this (the raw raster is piecewise-linear
-                                # per cell — on slopes the top would
-                                # undulate with raster facets, reading as
-                                # terraced ribs); roots stay on raw D
-    gate: np.ndarray = None     # (nlv, nu, nv) body-material lookup:
-                                # True where ribs/slab may exist at that
-                                # depth level (nTop-style body-field cut)
-    gate_d0: float = 0.0        # frame depth of gate level 0
-    gate_dlv: float = 1.0       # level spacing
+    Bo: np.ndarray              # distance to the OPEN boundary only
+                                # (taper ramp: rims must not fade it)
+    V: np.ndarray               # substrate vertices (frame coords)
+    F: np.ndarray               # substrate triangles
+    N: np.ndarray               # angle-weighted vertex pseudo-normals
+    dlo: np.ndarray             # (nu, nv) per-column band lower bound,
+                                # padded for slab + embed + blend dip
+    dhi: np.ndarray             # (nu, nv) per-column band upper bound,
+                                # padded for height + fillets (rib
+                                # corridor columns; slab-only elsewhere)
+    BV: np.ndarray = None       # closed BODY mesh (whole part, WORLD
+    BF: np.ndarray = None       # coords): negative-side material must
+    body_tol: float = 0.0       # live inside it (the nTop boolean-with-
+                                # the-body; kills the fake walls the
+                                # closest-point map grows in the void
+                                # between folded sheets)
+    ctr: np.ndarray = None      # frame->world transform for body queries
+    M: np.ndarray = None        # (3,3) frame axis columns
 
 
-def make_gradients(D, cell, max_slope=3.1, smooth_mm=None):
-    """Depth-map gradients for surface-normal rib extrusion.
+def _vertex_normals(V, F):
+    """Angle-weighted vertex pseudo-normals (Baerentzen & Anaes).
 
-    Clipped to the kept-filter slope (~72 deg) so infilled separator steps
-    cannot spike them, then gaussian-smoothed. Two variants are used: the
-    default light smoothing (2 cells) for CULL DETECTION (heavy smoothing
-    suppresses the peak slope of tight walls and they escape the cull,
-    emerging as crumpled rib sheets), and smooth_mm=1.5 for the NORMAL
-    CORRECTION (raster noise otherwise wobbles the correction at pattern
-    wavelength and ribs read as melted wax on curved transitions).
+    dot(x - cp, n(cp)) is the exact first-order side test on smooth
+    patches, stays correct across triangle edges, and degrades gracefully
+    at open boundaries — no watertightness required.
     """
-    from scipy.ndimage import gaussian_filter
-    Gu, Gv = np.gradient(D.astype(np.float32), cell)
-    m = np.hypot(Gu, Gv)
-    scale = np.where(m > max_slope, max_slope / np.clip(m, 1e-9, None), 1.0)
-    sigma = 2.0 if smooth_mm is None else max(2.0, smooth_mm / cell)
-    return (gaussian_filter(Gu * scale, sigma).astype(np.float32),
-            gaussian_filter(Gv * scale, sigma).astype(np.float32))
+    p0, p1, p2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    fn = np.cross(p1 - p0, p2 - p0)
+    ln = np.linalg.norm(fn, axis=1)
+    ok = ln > 1e-14
+    fnu = np.zeros_like(fn)
+    fnu[ok] = fn[ok] / ln[ok, None]
+    N = np.zeros_like(V)
+
+    def _ang(a, b, c):          # angle at corner a
+        u = b - a
+        w = c - a
+        cosv = (u * w).sum(axis=1) / np.clip(
+            np.linalg.norm(u, axis=1) * np.linalg.norm(w, axis=1),
+            1e-14, None)
+        return np.arccos(np.clip(cosv, -1.0, 1.0))
+
+    for src, ang in ((0, _ang(p0, p1, p2)), (1, _ang(p1, p2, p0)),
+                     (2, _ang(p2, p0, p1))):
+        np.add.at(N, F[:, src], fnu * ang[:, None])
+    ln = np.linalg.norm(N, axis=1)
+    ok = ln > 1e-14
+    N[ok] = N[ok] / ln[ok, None]
+    return N
+
+
+def _surface_eval(X, V, F, N, chunk=1_500_000):
+    """Exact signed distance to the substrate + closest surface points.
+
+    Unsigned distance from the BVH; sign from the interpolated
+    pseudo-normal.  Chunked to bound peak memory on multi-megavoxel
+    bands.
+    """
+    import igl
+    s = np.empty(len(X), np.float32)
+    C = np.empty((len(X), 3))
+    for i0 in range(0, len(X), chunk):
+        sl = slice(i0, min(i0 + chunk, len(X)))
+        Q = np.ascontiguousarray(X[sl], np.float64)
+        sqrD, I, Cp = igl.point_mesh_squared_distance(Q, V, F)
+        d = np.sqrt(sqrD)
+        # barycentric coords of the closest point in its triangle ->
+        # interpolated pseudo-normal -> side test
+        a, b, c = V[F[I, 0]], V[F[I, 1]], V[F[I, 2]]
+        v0 = b - a
+        v1 = c - a
+        v2 = Cp - a
+        d00 = (v0 * v0).sum(1)
+        d01 = (v0 * v1).sum(1)
+        d11 = (v1 * v1).sum(1)
+        d20 = (v2 * v0).sum(1)
+        d21 = (v2 * v1).sum(1)
+        den = np.clip(d00 * d11 - d01 * d01, 1e-20, None)
+        w1 = (d11 * d20 - d01 * d21) / den
+        w2 = (d00 * d21 - d01 * d20) / den
+        w0 = 1.0 - w1 - w2
+        n = (N[F[I, 0]] * w0[:, None] + N[F[I, 1]] * w1[:, None]
+             + N[F[I, 2]] * w2[:, None])
+        nn = np.linalg.norm(n, axis=1)
+        ok = nn > 1e-14
+        n[ok] = n[ok] / nn[ok, None]
+        side = np.einsum("ij,ij->i", Q - Cp, n)
+        s[sl] = np.where(side >= 0.0, d, -d).astype(np.float32)
+        C[sl] = Cp
+    return s, C
 
 
 def _bilinear(grid, u, v, cell, origin):
@@ -88,67 +158,17 @@ def _slab_depth(params):
     return params.embed + 0.6
 
 
-def field(u, v, d, grids, params):
-    """Signed field (negative = material) at frame-space points (u, v, d)."""
-    g = grids
-    D = _bilinear(g.D, u, v, g.cell, g.origin)
-    # ribs stand on the LOCAL surface normal, not the view axis: without
-    # this, slopes grow leaning blades with knife tops and lose height.
-    # First-order heightfield correction: s = true normal distance, and
-    # laterals are sampled at the normal ray's foot point.
-    if g.Gu is not None:
-        Du = _bilinear(g.Gu, u, v, g.cell, g.origin)
-        Dv = _bilinear(g.Gv, u, v, g.cell, g.origin)
-        c = 1.0 / np.sqrt(1.0 + Du * Du + Dv * Dv)
-        # fade the correction to vertical as the slope nears the cull:
-        # past ~45 deg the lateral shift (s*tan) outgrows the transition
-        # band, ribs fold over themselves and read as crumpled wax.
-        # Vertical full-height ribs on the band look like standing fins.
-        q = np.ones_like(c)
-        if g.Gm is not None:
-            gm = _bilinear(g.Gm, u, v, g.cell, g.origin)
-            t_hi = math.tan(math.radians(55.0))
-            t_lo = math.tan(math.radians(42.0))
-            q = np.clip((t_hi - gm) / (t_hi - t_lo), 0.0, 1.0)
-        s = (d - D) * (1.0 + (c - 1.0) * q)
-    else:
-        s = d - D
-    # pattern/boundary sampled at the FOOT (u, v): this is the projection
-    # mapping — the pattern is printed vertically onto the surface, so rib
-    # width is constant by construction. Sampling at the normal-ray foot
-    # swept the sample point across the pattern on slopes and ribs bulged,
-    # twisted and ballooned at junctions in every transition band. The
-    # slope correction only compensates HEIGHT (normal standing height).
-    P = _bilinear(g.P, u, v, g.cell, g.origin)
-    B = _bilinear(g.B, u, v, g.cell, g.origin)
-    inside = _bilinear(g.mask.astype(np.float32), u, v, g.cell,
-                       g.origin) > 0.5
-    # beyond the raster there is no surface: cap the field as air there,
-    # or marching cubes leaves open sheets at the sampling box walls
-    inside &= ((u >= g.origin[0]) & (v >= g.origin[1])
-               & (u <= g.origin[0] + (g.D.shape[0] - 1) * g.cell)
-               & (v <= g.origin[1] + (g.D.shape[1] - 1) * g.cell))
+def _rib_field(s, P, B, inside, Bo, params, cell):
+    """Rib prism + root blend + slab in TRUE surface coordinates.
 
+    s: exact signed distance to the substrate (negative inside the
+    body); P/B/Bo/mask sampled at each point's closest surface point.
+    """
     height = np.float32(params.height)
-    if g.Ds is not None:
-        # tops ride the smoothed surface: raw D is piecewise-linear per
-        # raster cell, so on slopes the top plane undulates with raster
-        # facets and ribs read as terraced wax. Offset is clamped — near
-        # depth discontinuities (lips) the smoothing blends two levels.
-        # Applied BEFORE the run-out taper so a fully tapered edge still
-        # yields zero material. Roots/embed stay on raw D: no floating.
-        ds_off = _bilinear(g.Ds, u, v, g.cell, g.origin) - D
-        if g.Gu is not None:
-            ds_off = ds_off * c
-        height = height + np.clip(ds_off, -1.2, 1.2)
     if params.taper_len > 0 and not params.border:
-        # the run-out ramp follows the OPEN boundary only: slope-cull rims
-        # are interior transitions where retaining ribs meet lattice ribs
-        # at full height — fading there reads as melted stubs. Sampled at
-        # the foot: the shifted point would wobble the ramp on slopes.
-        Bo = g.B if g.Bo is None else g.Bo
-        open_d = _bilinear(Bo, u, v, g.cell, g.origin)
-        height = height * np.clip(open_d / params.taper_len, 0.0, 1.0)
+        # the run-out ramp follows the OPEN boundary only: domain rims
+        # are interior transitions and must not fade the height
+        height = height * np.clip(Bo / params.taper_len, 0.0, 1.0)
 
     half = np.float32(params.thickness / 2.0)
     if params.draft_deg > 0:
@@ -167,12 +187,12 @@ def field(u, v, d, grids, params):
     else:
         prism = np.maximum(wall, s - height)
     prism = np.maximum(prism, -s - params.embed)
-    # ribs end ON the true domain boundary (B is its distance field), not
-    # on the pixelated mask edge — cut mask cells read as a serrated
-    # fringe. The 1.2-cell setback suppresses sub-voxel slivers at cull
-    # rims (they surfaced as flakes stuck to steep walls); border rib
+    # ribs end ON the true domain boundary (B is its distance field,
+    # sampled at the closest surface point), not on the pixelated mask
+    # edge — cut mask cells read as a serrated fringe.  The 1.2-cell
+    # setback suppresses sub-voxel slivers at rims; border rib
     # centerlines sit at B=0, so borders become flush walls.
-    prism = np.maximum(prism, 1.2 * np.float32(g.cell) - B)
+    prism = np.maximum(prism, 1.2 * np.float32(cell) - B)
 
     shell = s + _SINK                   # body half-space, sunk out of view
     k = float(max(params.fillet_root, 0.0))
@@ -185,33 +205,196 @@ def field(u, v, d, grids, params):
     f = np.maximum(f, -s - _slab_depth(params))          # slab floor cap
     # the slab must end on the domain boundary too: applied after the cap
     # (the prism clamp above cannot reach it), otherwise the sheet follows
-    # the pixelated mask/coverage edge and frays at every recess rim
-    f = np.maximum(f, 1.2 * np.float32(g.cell) - B)
-    # cull-band termination: a linear ramp against the (smooth) distance
-    # to the steep band ends every rib on a clean offset line ~1mm before
-    # the band — sampled at the foot, so leaning tops stay put
-    if g.Sc is not None:
-        sc = _bilinear(g.Sc, u, v, g.cell, g.origin)
-        f = np.maximum(f, np.float32(max(1.0, 0.75 * params.thickness)) - sc)
-    # nTop-style body cut: material may only exist inside the body (or
-    # within tolerance of its surface). Looked up at the sample's own 3D
-    # position, so rib tops leaning past a lip terminate against the smooth
-    # recess wall instead of being amputated at the pixelated mask edge.
-    if g.gate is not None:
-        gi = np.clip(((u - g.origin[0]) / g.cell).astype(np.int64), 0,
-                     g.gate.shape[1] - 1)
-        gj = np.clip(((v - g.origin[1]) / g.cell).astype(np.int64), 0,
-                     g.gate.shape[2] - 1)
-        gl = np.clip(((d - g.gate_d0) / g.gate_dlv).astype(np.int64), 0,
-                     g.gate.shape[0] - 1)
-        body_ok = g.gate[gl, gi, gj]
-    else:
-        body_ok = True
-    # air must stay within a few voxels of zero: a 1e3 jump puts rim
-    # crossings at t~0.001 — micron triangles that collapse into the
-    # degenerate/duplicate faces manifold3d rejects
+    # the pixelated mask edge and frays at every recess rim
+    f = np.maximum(f, 1.2 * np.float32(cell) - B)
+    air = np.float32(max(4.0 * cell, 0.6))
+    return np.where(inside, f.astype(np.float32), air)
+
+
+def mesh_field(surface, params, resolution, tile=192, reports=None):
+    """March the field on the global grid; returns [(verts, tris)] in frame
+    coordinates (one welded solid), or [] if the field is empty."""
+    from skimage import measure
+
+    g = surface
+    res = float(resolution)
+    nu, nv = g.dlo.shape
+    u_lo = g.origin[0]
+    v_lo = g.origin[1]
+    u_hi = u_lo + (nu - 1) * g.cell
+    v_hi = v_lo + (nv - 1) * g.cell
+    # global integer sample grid (absolute multiples of res)
+    iu0 = int(math.floor(u_lo / res)) - 1
+    iu1 = int(math.ceil(u_hi / res)) + 1
+    iv0 = int(math.floor(v_lo / res)) - 1
+    iv1 = int(math.ceil(v_hi / res)) + 1
+
     air = np.float32(max(4.0 * g.cell, 0.6))
-    return np.where(inside & body_ok, f.astype(np.float32), air)
+    all_v, all_f, off = [], [], 0
+    DSLAB = 128                       # max d-slices per marching box
+    for ta in range(iu0, iu1, tile):
+        tb = min(ta + tile, iu1)
+        for tc in range(iv0, iv1, tile):
+            td = min(tc + tile, iv1)
+            # one-cell overlap: neighbors evaluate the shared cells from
+            # identical samples and produce identical triangles; each
+            # triangle is kept by the tile owning its centroid, so tile
+            # joints cannot crack
+            us = np.arange(ta - 1, tb + 2) * res
+            vs = np.arange(tc - 1, td + 2) * res
+            # nearest raster column per sample
+            gi = np.clip(np.round((us - u_lo) / g.cell).astype(np.int64),
+                         0, nu - 1)
+            gj = np.clip(np.round((vs - v_lo) / g.cell).astype(np.int64),
+                         0, nv - 1)
+            if not g.mask[gi][:, gj].any():
+                continue
+            blo = g.dlo[gi][:, gj]
+            bhi = g.dhi[gi][:, gj]
+            d0 = int(math.floor(float(blo.min()) / res))
+            d1 = int(math.ceil(float(bhi.max()) / res))
+            if d1 <= d0:
+                continue
+            # tall folded regions span enormous depth ranges; march in
+            # d-slabs so no box explodes (2-slice overlap, ownership by
+            # centroid — same contract as the u/v tile joints)
+            for e0 in range(d0, d1, DSLAB):
+                e1 = min(e0 + DSLAB, d1)
+                ds = np.arange(e0 - 1, e1 + 2) * res
+                # OpenVDB-style narrow band: evaluate only within the
+                # per-column padded depth bounds (no meshgrids — the
+                # band mask is built by broadcasting and points are
+                # gathered by index)
+                band = ((ds[None, None, :] >= blo[:, :, None])
+                        & (ds[None, None, :] <= bhi[:, :, None]))
+                if not band.any():
+                    continue
+                iu, iv, iw = np.nonzero(band)
+                X = np.column_stack([us[iu], vs[iv], ds[iw]])
+                s, C = _surface_eval(X, g.V, g.F, g.N)
+                del X
+                # pattern/boundary/mask sampled at the closest surface
+                # point: the closest-point surface field.  The pattern is
+                # carried along the surface, so rib width is constant in
+                # surface coordinates on any slope, and ribs on walls
+                # continue the lattice of the flanks they connect to.
+                cu = C[:, 0]
+                cv = C[:, 1]
+                P = _bilinear(g.P, cu, cv, g.cell, g.origin)
+                B = _bilinear(g.B, cu, cv, g.cell, g.origin)
+                Bo = _bilinear(g.Bo, cu, cv, g.cell, g.origin)
+                ins = _bilinear(g.mask.astype(np.float32), cu, cv, g.cell,
+                                g.origin) > 0.5
+                # beyond the raster there is no surface: cap the field as
+                # air there (by the SAMPLE's own position), or marching
+                # cubes leaves open sheets at the sampling box walls
+                ins &= ((us[iu] >= u_lo) & (us[iu] <= u_hi)
+                        & (vs[iv] >= v_lo) & (vs[iv] <= v_hi))
+                vals = _rib_field(s, P, B, ins, Bo, params, g.cell)
+                del P, B, Bo, ins, cu, cv
+                # nTop-style boolean with the body: material on the
+                # NEGATIVE side of the substrate (the slab) must be
+                # inside the BODY.  On a wrapped selection the
+                # closest-point map switches between folded sheets, and
+                # the slab of one sheet would be truncated by a raw wall
+                # deep in the void between them — the body field cuts
+                # exactly there.  Rib-side voxels hug the substrate and
+                # are exempt (a body cut at rib-top height would eat
+                # every rib).  Queried only at actual material
+                # candidates, and in WORLD coordinates.
+                if g.BV is not None:
+                    import igl
+                    # material candidates on the NEGATIVE side only: the
+                    # slab.  Rib voxels are also vals<0 but stand on the
+                    # positive side — a body cut at rib-top height would
+                    # eat every rib.
+                    cand = (vals < 0.0) & (s < 0.5)
+                    del s
+                    if cand.any():
+                        Xw = np.ascontiguousarray(
+                            np.column_stack([us[iu[cand]], vs[iv[cand]],
+                                             ds[iw[cand]]]) @ g.M + g.ctr)
+                        out = igl.signed_distance(Xw, g.BV, g.BF)
+                        # raising the field value above zero cuts the
+                        # voxel out of the solid
+                        vals[cand] = np.maximum(
+                            vals[cand],
+                            out[0].astype(np.float32) - g.body_tol)
+                        del Xw, out
+                vol = np.full(band.shape, air, np.float32)
+                vol[band] = vals
+                del band, vals, iu, iv, iw, C
+                if vol.min() >= 0 or vol.max() <= 0:
+                    continue
+                verts, faces, _, _ = measure.marching_cubes(
+                    vol, 0.0, spacing=(res, res, res))
+                del vol
+                verts += (us[0], vs[0], ds[0])
+                cen = verts[faces].mean(axis=1)
+                lo_u = -np.inf if ta == iu0 else ta * res
+                hi_u = np.inf if tb >= iu1 else tb * res
+                lo_v = -np.inf if tc == iv0 else tc * res
+                hi_v = np.inf if td >= iv1 else td * res
+                lo_d = -np.inf if e0 == d0 else e0 * res
+                hi_d = np.inf if e1 >= d1 else e1 * res
+                own = ((cen[:, 0] >= lo_u) & (cen[:, 0] < hi_u)
+                       & (cen[:, 1] >= lo_v) & (cen[:, 1] < hi_v)
+                       & (cen[:, 2] >= lo_d) & (cen[:, 2] < hi_d))
+                faces = faces[own]
+                if not len(faces):
+                    continue
+                all_v.append(verts)
+                all_f.append(faces + off)
+                off += len(verts)
+
+    if not all_v:
+        return []
+    v, f = _weld(np.vstack(all_v).astype(np.float64), np.vstack(all_f))
+    # per-component FIRST (before smoothing): drop marching-cubes crumbs
+    # (isolated slivers at rims and closest-point switch walls) and orient
+    # each body outward by its own signed volume.  Smoothing before this
+    # lets crumb vertices with long thin triangles get launched tens of
+    # millimeters across the void by the uniform graph Laplacian.
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+    adj = sp.csr_matrix((np.ones(len(f) * 3, np.int8),
+                         (np.concatenate([f[:, 0], f[:, 1], f[:, 2]]),
+                          np.concatenate([f[:, 1], f[:, 2], f[:, 0]]))),
+                        shape=(len(v), len(v)))
+    _, lab = connected_components(adj, directed=False)
+    keep = []
+    for cid in np.unique(lab[f[:, 0]]):
+        fc = f[lab[f[:, 0]] == cid]
+        vol = np.einsum("ij,ij->i", v[fc[:, 0]],
+                        np.cross(v[fc[:, 1]], v[fc[:, 2]])).sum() / 6.0
+        if abs(vol) < 8.0 or len(fc) < 24:
+            continue
+        keep.append(fc[:, ::-1] if vol < 0 else fc)
+    if not keep:
+        return []
+    f = np.vstack(keep)
+    # drop vertices orphaned by the crumb filter: they must not ride
+    # along in the output (and must not be smoothed)
+    used, f = np.unique(f, return_inverse=True)
+    v = np.ascontiguousarray(v[used])
+    f = np.ascontiguousarray(f.reshape(-1, 3))
+    v = _taubin(v, f, rounds=6)
+    # pinches first: boundary loops through pinched vertices cannot be
+    # walked, so holes must be filled on the split mesh
+    v, f = _repair_pinches(v, f)
+    v, f = _fill_microholes(v, f)
+    if reports is not None:
+        import manifold3d as m3d
+        mesh = m3d.Mesh(v.astype(np.float32), f.astype(np.uint32))
+        # marching cubes leaves micro-cracks at tile planes and mask rims;
+        # manifold3d's native merge() sews this exact defect class
+        try:
+            mesh.merge()
+        except Exception:
+            pass
+        if m3d.Manifold(mesh).is_empty():
+            reports.append("implicit mesh failed manifold validation")
+    return [(v, f.astype(np.int64))]
 
 
 def _taubin(v, f, rounds=4, lam=0.5, mu=-0.53):
@@ -324,165 +507,82 @@ def _weld(verts, faces, tol=1e-5):
     return verts[idx], f[ok]
 
 
-def mesh_field(grids, params, resolution, tile=192, reports=None):
-    """March the field on the global grid; returns [(verts, tris)] in frame
-    coordinates (one welded solid), or [] if the field is empty."""
-    from skimage import measure
+# --- stage 1: pattern-space rasters + band bounds from real geometry ----
 
-    g = grids
-    res = float(resolution)
-    nu, nv = g.D.shape
-    u_lo = g.origin[0]
-    v_lo = g.origin[1]
-    u_hi = u_lo + (nu - 1) * g.cell
-    v_hi = v_lo + (nv - 1) * g.cell
-    # global integer sample grid (absolute multiples of res)
-    iu0 = int(math.floor(u_lo / res)) - 1
-    iu1 = int(math.ceil(u_hi / res)) + 1
-    iv0 = int(math.floor(v_lo / res)) - 1
-    iv1 = int(math.ceil(v_hi / res)) + 1
+def _rasterize_depth_range(flat, depth, tris, cell, origin, shape2d):
+    """Per-column [min, max] surface depth: accurate inside-fill first,
+    conservative per-triangle bounding boxes only for what it misses.
 
-    pad = _slab_depth(params) + 2 * res
-    top_pad = params.height + max(params.fillet_root, 0.0) \
-        + max(params.fillet_top, 0.0) + 2 * res
-
-    all_v, all_f, off = [], [], 0
-    for ta in range(iu0, iu1, tile):
-        tb = min(ta + tile, iu1)
-        for tc in range(iv0, iv1, tile):
-            td = min(tc + tile, iv1)
-            # one-cell overlap: neighbors evaluate the shared cells from
-            # identical samples and produce identical triangles; each
-            # triangle is kept by the tile owning its centroid, so tile
-            # joints cannot crack (naked abutment relied on lewiner's
-            # boundary-cell triangulation matching — empirically it does
-            # not, and the mesh leaked thousands of micro-cracks)
-            us = np.arange(ta - 1, tb + 2) * res
-            vs = np.arange(tc - 1, td + 2) * res
-            # depth band from the tile's masked surface cells
-            ci0 = np.clip(((us[0] - u_lo) / g.cell).astype(int), 0, nu - 1)
-            ci1 = np.clip(int((us[-1] - u_lo) / g.cell) + 2, 1, nu)
-            cj0 = np.clip(((vs[0] - v_lo) / g.cell).astype(int), 0, nv - 1)
-            cj1 = np.clip(int((vs[-1] - v_lo) / g.cell) + 2, 1, nv)
-            m = g.mask[ci0:ci1, cj0:cj1]
-            if not m.any():
-                continue
-            Dt = g.D[ci0:ci1, cj0:cj1][m]
-            # normal-extruded ribs on slopes reach height/cos(theta) along
-            # the view axis: stretch this tile's band by its local slope.
-            # Full-resolution max — a subsampled estimate once let a rib
-            # poke through the band top, leaving an open sheet.
-            scale = 1.0
-            if g.Gu is not None:
-                gm = float(np.hypot(g.Gu[ci0:ci1, cj0:cj1],
-                                    g.Gv[ci0:ci1, cj0:cj1]).max())
-                scale = math.sqrt(1.0 + gm * gm)
-            d0 = int(math.floor((Dt.min() - pad * scale) / res))
-            d1 = int(math.ceil((Dt.max() + top_pad * scale) / res))
-            ds = np.arange(d0, d1 + 1) * res
-            U, V, W = np.meshgrid(us, vs, ds, indexing="ij")
-            vol = field(U.ravel(), V.ravel(), W.ravel(), g, params) \
-                .reshape(U.shape)
-            if vol.min() >= 0 or vol.max() <= 0:
-                continue
-            verts, faces, _, _ = measure.marching_cubes(
-                vol, 0.0, spacing=(res, res, res))
-            verts += (us[0], vs[0], ds[0])
-            cen = verts[faces].mean(axis=1)
-            lo_u = -np.inf if ta == iu0 else ta * res
-            hi_u = np.inf if tb >= iu1 else tb * res
-            lo_v = -np.inf if tc == iv0 else tc * res
-            hi_v = np.inf if td >= iv1 else td * res
-            own = ((cen[:, 0] >= lo_u) & (cen[:, 0] < hi_u)
-                   & (cen[:, 1] >= lo_v) & (cen[:, 1] < hi_v))
-            faces = faces[own]
-            if not len(faces):
-                continue
-            all_v.append(verts)
-            all_f.append(faces + off)
-            off += len(verts)
-
-    if not all_v:
-        return []
-    v, f = _weld(np.vstack(all_v).astype(np.float64), np.vstack(all_f))
-    v = _taubin(v, f, rounds=6)
-    # per-component: drop marching-cubes crumbs (isolated slivers at steep
-    # rims), orient each body outward by its own signed volume
-    import scipy.sparse as sp
-    from scipy.sparse.csgraph import connected_components
-    adj = sp.csr_matrix((np.ones(len(f) * 3, np.int8),
-                         (np.concatenate([f[:, 0], f[:, 1], f[:, 2]]),
-                          np.concatenate([f[:, 1], f[:, 2], f[:, 0]]))),
-                        shape=(len(v), len(v)))
-    _, lab = connected_components(adj, directed=False)
-    keep = []
-    for cid in np.unique(lab[f[:, 0]]):
-        fc = f[lab[f[:, 0]] == cid]
-        vol = np.einsum("ij,ij->i", v[fc[:, 0]],
-                        np.cross(v[fc[:, 1]], v[fc[:, 2]])).sum() / 6.0
-        if abs(vol) < 8.0 or len(fc) < 24:
-            continue
-        keep.append(fc[:, ::-1] if vol < 0 else fc)
-    if not keep:
-        return []
-    f = np.vstack(keep)
-    # pinches first: boundary loops through pinched vertices cannot be
-    # walked, so holes must be filled on the split mesh
-    v, f = _repair_pinches(v, f)
-    v, f = _fill_microholes(v, f)
-    if reports is not None:
-        import manifold3d as m3d
-        mesh = m3d.Mesh(v.astype(np.float32), f.astype(np.uint32))
-        # marching cubes leaves micro-cracks at tile planes and mask rims;
-        # manifold3d's native merge() sews this exact defect class
-        try:
-            mesh.merge()
-        except Exception:
-            pass
-        if m3d.Manifold(mesh).is_empty():
-            reports.append("implicit mesh failed manifold validation")
-    return [(v, f.astype(np.int64))]
-
-
-# --- stage 1: pattern-space rasters from real geometry ----------------------
-
-def _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d,
-                     backmost=False):
-    """Front-most (or back-most) surface depth per cell from the kept
-    projected triangles."""
-    D = np.full(shape2d, -1e9 if not backmost else 1e9, np.float32)
+    Inside-fill rasterization drops near-edge-on triangles (a steep wall
+    projects to a sliver or a line), which would truncate the depth band
+    exactly on the walls ribs must climb — those get their bounding box
+    filled.  Plain bbox fill everywhere would inflate the band on every
+    oblique triangle (a diagonal flank paints its full depth span over
+    columns it merely brushes), costing megavoxels of pointless queries.
+    """
+    Dlo = np.full(shape2d, 1e9, np.float32)
+    Dhi = np.full(shape2d, -1e9, np.float32)
+    covered = np.zeros(shape2d, bool)
     u0, v0 = origin
-    for a, b, c in tris[kept]:
-        p = (np.array([flat[a], flat[b], flat[c]]) - (u0, v0)) / cell
-        dz = np.array([depth[a], depth[b], depth[c]], np.float64)
-        i0 = max(int(np.floor(p[:, 0].min())), 0)
-        i1 = min(int(np.ceil(p[:, 0].max())) + 1, shape2d[0])
-        j0 = max(int(np.floor(p[:, 1].min())), 0)
-        j1 = min(int(np.ceil(p[:, 1].max())) + 1, shape2d[1])
+
+    def _bbox(a, b, c):
+        i0 = max(int(math.floor((min(flat[a, 0], flat[b, 0], flat[c, 0])
+                                 - u0) / cell)), 0)
+        i1 = min(int(math.ceil((max(flat[a, 0], flat[b, 0], flat[c, 0])
+                                - u0) / cell)) + 1, shape2d[0])
+        j0 = max(int(math.floor((min(flat[a, 1], flat[b, 1], flat[c, 1])
+                                 - v0) / cell)), 0)
+        j1 = min(int(math.ceil((max(flat[a, 1], flat[b, 1], flat[c, 1])
+                                - v0) / cell)) + 1, shape2d[1])
+        return i0, i1, j0, j1
+
+    for a, b, c in tris:
+        i0, i1, j0, j1 = _bbox(a, b, c)
         if i1 <= i0 or j1 <= j0:
             continue
-        gi, gj = np.meshgrid(np.arange(i0, i1), np.arange(j0, j1),
-                             indexing="ij")
+        p = (np.array([flat[a], flat[b], flat[c]]) - (u0, v0)) / cell
         det = ((p[1, 0] - p[0, 0]) * (p[2, 1] - p[0, 1])
                - (p[2, 0] - p[0, 0]) * (p[1, 1] - p[0, 1]))
         if abs(det) < 1e-12:
             continue
+        gi, gj = np.meshgrid(np.arange(i0, i1), np.arange(j0, j1),
+                             indexing="ij")
         w1 = ((gi - p[0, 0]) * (p[2, 1] - p[0, 1])
               - (p[2, 0] - p[0, 0]) * (gj - p[0, 1])) / det
         w2 = ((p[1, 0] - p[0, 0]) * (gj - p[0, 1])
               - (gi - p[0, 0]) * (p[1, 1] - p[0, 1])) / det
         w0 = 1.0 - w1 - w2
-        eps = -0.02
-        inside = (w0 >= eps) & (w1 >= eps) & (w2 >= eps)
+        inside = (w0 >= -0.02) & (w1 >= -0.02) & (w2 >= -0.02)
         if not inside.any():
             continue
-        dval = (w0 * dz[0] + w1 * dz[1] + w2 * dz[2]).astype(np.float32)
-        sub = D[i0:i1, j0:j1]
-        if backmost:
-            np.copyto(sub, np.minimum(sub, np.where(inside, dval, 1e9)))
-        else:
-            np.copyto(sub, np.maximum(sub, np.where(inside, dval, -1e9)))
-    return D
+        dmin = min(depth[a], depth[b], depth[c])
+        dmax = max(depth[a], depth[b], depth[c])
+        # interpolated depth: exact per-cell, no facet terracing in the
+        # band bounds
+        dval = (w0 * depth[a] + w1 * depth[b] + w2 * depth[c])
+        sub_lo = Dlo[i0:i1, j0:j1]
+        np.copyto(sub_lo, np.minimum(sub_lo, np.where(inside, dval, 1e9)))
+        sub_hi = Dhi[i0:i1, j0:j1]
+        np.copyto(sub_hi, np.maximum(sub_hi, np.where(inside, dval, -1e9)))
+        sub_c = covered[i0:i1, j0:j1]
+        np.copyto(sub_c, sub_c | inside)
+    # edge-on slivers: bounding-box fill of the cells inside-fill missed
+    for a, b, c in tris:
+        i0, i1, j0, j1 = _bbox(a, b, c)
+        if i1 <= i0 or j1 <= j0:
+            continue
+        win = ~covered[i0:i1, j0:j1]
+        if not win.any():
+            continue
+        dmin = min(depth[a], depth[b], depth[c])
+        dmax = max(depth[a], depth[b], depth[c])
+        sub_lo = Dlo[i0:i1, j0:j1]
+        np.copyto(sub_lo, np.minimum(sub_lo, np.where(win, dmin, 1e9)))
+        sub_hi = Dhi[i0:i1, j0:j1]
+        np.copyto(sub_hi, np.maximum(sub_hi, np.where(win, dmax, -1e9)))
+        sub_c = covered[i0:i1, j0:j1]
+        np.copyto(sub_c, sub_c | win)
+    return Dlo, Dhi
 
 
 def _rasterize_rings(geom, cell, origin, shape2d):
@@ -555,9 +655,10 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
                        frame_cache=None):
     """Implicit-engine entry: same contract as build_rib_meshes.
 
-    Projected mapping only: the field lives in the shared front-view frame.
-    Returns ([(verts, tris)], reports) — normally ONE watertight solid of
-    ribs blended into a thin sub-surface slab.
+    Surface-field mapping: the substrate is the exact distance field of
+    the selected faces; the pattern rides the closest-point surface
+    field.  Returns ([(verts, tris)], reports) — normally ONE watertight
+    solid of ribs blended into a thin sub-surface slab.
     """
     from scipy.ndimage import distance_transform_edt
     from .meshing import region_meshes
@@ -598,16 +699,12 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     flat = (region.vertices - ctr) @ axes
     depth = (region.vertices - ctr) @ n_axis
     tris = np.asarray(region.triangles, np.int64)
-    e1 = flat[tris[:, 1]] - flat[tris[:, 0]]
-    e2 = flat[tris[:, 2]] - flat[tris[:, 0]]
-    signed2 = 0.5 * (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0])
-    v3 = region.vertices
-    area3 = 0.5 * np.linalg.norm(
-        np.cross(v3[tris[:, 1]] - v3[tris[:, 0]],
-                 v3[tris[:, 2]] - v3[tris[:, 0]]), axis=1)
-    kept = np.nonzero(signed2 > 0.30 * np.clip(area3, 1e-12, None))[0]
 
-    domain = _kept_domain(flat, tris, kept, params)
+    # The rib domain is the projection of the WHOLE selection: steep
+    # walls and overhangs are rib territory now (the closest-point field
+    # ribs them exactly like flat faces), so there is no front-facing
+    # filter — that filter was the heightfield era's cull in disguise.
+    domain = _kept_domain(flat, tris, np.arange(len(tris)), params)
     if domain is None or domain.is_empty:
         raise RibbingError("selection is edge-on to the projection plane")
     inset = domain.buffer(-params.margin) if params.margin > 0 else domain
@@ -625,41 +722,19 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     shape2d = (int((maxx - origin[0]) / cell) + 3,
                int((maxy - origin[1]) / cell) + 3)
 
-    D = _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d)
-    Dback = _rasterize_depth(flat, depth, tris, kept, cell, origin, shape2d,
-                             backmost=True)
+    Dlo, Dhi = _rasterize_depth_range(flat, depth, tris, cell, origin,
+                                      shape2d)
+    unc = Dlo > 1e8
+    if unc.any() and (~unc).any():
+        # sealed separator strips borrow the nearest column's band so the
+        # surface field stays evaluable across them
+        _, (ri, ci) = distance_transform_edt(unc, return_indices=True)
+        Dlo[unc] = Dlo[ri[unc], ci[unc]]
+        Dhi[unc] = Dhi[ri[unc], ci[unc]]
+
     inset_mask = _rasterize_rings(inset, cell, origin, shape2d)
-    covered = D > -1e8
-    if not covered.any():
-        raise RibbingError("selection is edge-on to the projection plane")
-    if (~covered).any():
-        # sealed separator strips borrow the nearest flank's depth so ribs
-        # bridge them; filling EVERY uncovered cell (not just domain holes)
-        # keeps the depth gradients finite — a -1e9 cliff at the domain
-        # edge turns into inf*0 = NaN and the gaussian smears it inward
-        _, (ri, ci) = distance_transform_edt(~covered, return_indices=True)
-        D[~covered] = D[ri[~covered], ci[~covered]]
-    # a heightfield with first-order normal correction cannot represent
-    # near-cull walls: past ~55 deg the ribs shred. Cull steep BANDS from
-    # the rib domain — from the SMOOTHED gradients, so the cull contour is
-    # smooth instead of stair-stepped; morphological opening spares the
-    # one-cell gradient cliffs of infilled separator strips (those must
-    # keep bridging).
-    from scipy.ndimage import binary_opening
-    Gu, Gv = make_gradients(D, cell)
-    steep = binary_opening(
-        np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
-    Gu, Gv = make_gradients(D, cell, smooth_mm=1.5)
-    Gm = np.hypot(Gu, Gv)
-    from scipy.ndimage import gaussian_filter as _gf
-    Ds = _gf(D, max(2.0, 1.5 / cell)).astype(np.float32)
-    # columns whose front surface is backed by material within a few mm
-    # along the view ray: the heightfield can be trusted there. Over
-    # recess floors and past the silhouette the front-most depth is a lip
-    # far in front of the true surface — handled by the body gate below.
-    backed = ((D - Dback) <= max(2.0 * params.thickness, 3.0)) \
-        & (Dback <= 1e8)
-    mask = inset_mask & ~steep
+    if not inset_mask.any():
+        raise RibbingError("margin leaves no rib area")
 
     segs = list(generate_segments(params, _lattice_window(params,
                                                           domain.bounds)))
@@ -673,77 +748,51 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
     P = _exact_pattern_distance(segs, cell, origin, shape2d, reach)
     if P.min() > reach:
         raise RibbingError("pattern produced no ribs on this region")
-    # rib-termination distance measured from the FINAL domain (inset
-    # boundary, slope-cull rims and their dilated rim strips): the -B clamp
-    # ends every rib on it
-    B = (distance_transform_edt(mask) * cell).astype(np.float32)
-    # run-out ramp distance: to the OPEN boundary only (the inset polygon
-    # edge) — rims are interior and must not fade the height
-    Bo = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
-    # cull-band distance: ribs end on a smooth offset of the band. The
-    # band edge itself is pixelated and meanders with gradient noise, but
-    # its distance field is smooth — the ramp in field() terminates ribs
-    # on a clean perpendicular line ~1mm before the band. Gaussian-
-    # smoothing the field straightens the offset lines against the
-    # band's gradient-noise meander. Rim walls (chain-following
-    # extrusions) were tried here and read as chewed strips; the body
-    # gate + this ramp is the clean nTop-style answer.
-    from scipy.ndimage import gaussian_filter as _gf
-    Sc = _gf(distance_transform_edt(~steep), 6.0).astype(np.float32) * cell
+    # rib-termination distance measured from the FINAL domain (the inset
+    # boundary): the -B clamp ends every rib on it
+    B = (distance_transform_edt(inset_mask) * cell).astype(np.float32)
+    Bo = B.copy()
 
-    # --- nTop-style body gate -------------------------------------------
-    # additive material is cut by the BODY's own field, not the pixelated
-    # 2D domain: points in the void behind a lip (over recess floors, past
-    # the silhouette) are removed against the smooth recess wall, so ribs
-    # die into the body exactly like an implicit-modeler feature. Looked
-    # up as a body-interior test (fast-winding SDF <= tol) on depth
-    # levels, only over unbacked columns near the void boundary — deep
-    # void is cut outright and backed columns are always allowed.
-    tol = float(np.clip(0.25 * params.thickness, 0.2, 0.5))
-    g_d0 = -(params.embed + _slab_depth(params))
-    g_d1 = params.height
-    g_nlv = max(int(math.ceil((g_d1 - g_d0) / max(res, 0.4))) + 1, 2)
-    g_dlv = (g_d1 - g_d0) / (g_nlv - 1)
-    gate = np.zeros((g_nlv,) + shape2d, bool)
-    gate[:, backed] = True
-    from scipy.ndimage import distance_transform_edt as _edt
-    void_d = _edt(backed) * cell          # depth inside unbacked columns
-    band = 4.0
-    cand = (~backed) & (void_d <= band) & inset_mask
-    t_gate = time.time()
-    if cand.any():
-        import igl
-        from .meshing import mesh_shape
-        bm = mesh_shape(shape, 0.3, 0.3)
-        bv, bf, boff = [], [], 0
-        for m in bm:
-            bv.append(np.asarray(m.vertices, np.float64))
-            bf.append(np.asarray(m.triangles, np.int64) + boff)
-            boff += len(m.vertices)
-        BV = np.vstack(bv)
-        BF = np.vstack(bf)
-        ci, cj = np.nonzero(cand)
-        cu = ci * cell + origin[0]
-        cv = cj * cell + origin[1]
-        n_c = len(ci)
-        chunk = 1_500_000
-        for l in range(g_nlv):
-            dd = g_d0 + l * g_dlv
-            for s0 in range(0, n_c, chunk):
-                sl = slice(s0, min(s0 + chunk, n_c))
-                pts = ctr[None, :] + cu[sl, None] * axes[:, 0] \
-                    + cv[sl, None] * axes[:, 1] + dd * n_axis[None, :]
-                out = igl.signed_distance(np.ascontiguousarray(pts), BV, BF)
-                gate[l, ci[sl], cj[sl]] = out[0] <= tol
-    rep.warnings.append(
-        f"body gate: {int(cand.sum())} cols x {g_nlv} lv, "
-        f"{time.time() - t_gate:.0f}s")
+    # --- substrate: the selection mesh itself, in frame coordinates -----
+    V = np.ascontiguousarray(np.column_stack([flat, depth]), np.float64)
+    F = np.ascontiguousarray(tris, np.int64)
+    N = _vertex_normals(V, F)
 
-    grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, Gm=Gm, Bo=Bo, Sc=Sc, Ds=Ds, gate=gate,
-                       gate_d0=g_d0, gate_dlv=g_dlv)
+    # closed BODY mesh for the negative-side cut (nTop boolean-with-the-
+    # body): the slab of a wrapped selection gets fake walls in the void
+    # between folded sheets where the closest-point map switches — the
+    # body field cuts exactly there.  Threshold sits above the worst-case
+    # substrate/body tessellation gap so real slab never clips.
+    from .meshing import mesh_shape
+    bv, bf, boff = [], [], 0
+    for m in mesh_shape(shape, 0.3, 0.3):
+        bv.append(np.asarray(m.vertices, np.float64))
+        bf.append(np.asarray(m.triangles, np.int64) + boff)
+        boff += len(m.vertices)
+    BV = np.vstack(bv)
+    BF = np.vstack(bf)
+    body_tol = _slab_depth(params) + 1.2
+
+    # --- OpenVDB-style narrow band --------------------------------------
+    # padded per-column depth bounds.  Rib-corridor columns (near pattern
+    # centerlines) get the tall band; the rest only enough for the
+    # sub-surface slab — the dominant query saving on flat faces.
+    lowpad = params.embed + _slab_depth(params) + max(0.6, 2.0 * res)
+    highpad = params.height + max(params.fillet_root, params.fillet_top) \
+        + max(0.6, 2.0 * res)
+    dlo = (Dlo - lowpad).astype(np.float32)
+    dhi = np.where(P <= reach, Dhi + highpad,
+                   Dhi + max(0.6, 2.0 * res)).astype(np.float32)
+
+    surface = SurfaceField(cell=cell, origin=origin, P=P, B=B,
+                           mask=inset_mask, Bo=Bo, V=V, F=F, N=N,
+                           dlo=dlo, dhi=dhi, BV=BV, BF=BF,
+                           body_tol=body_tol, ctr=ctr,
+                           M=np.ascontiguousarray(
+                               np.column_stack([axes[:, 0], axes[:, 1],
+                                                n_axis])))
     warn = []
-    clusters = mesh_field(grids, params, resolution=res, reports=warn)
+    clusters = mesh_field(surface, params, resolution=res, reports=warn)
     rep.warnings += warn
     rep.segments = len(segs)
     rep.lofted = len(segs) if clusters else 0
