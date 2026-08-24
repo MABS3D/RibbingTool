@@ -106,15 +106,17 @@ def field(u, v, d, grids, params):
             t_lo = math.tan(math.radians(42.0))
             q = np.clip((t_hi - gm) / (t_hi - t_lo), 0.0, 1.0)
         s = (d - D) * (1.0 + (c - 1.0) * q)
-        fu = u + s * Du * c * q
-        fv = v + s * Dv * c * q
     else:
-        c = 1.0
         s = d - D
-        fu, fv = u, v
-    P = _bilinear(g.P, fu, fv, g.cell, g.origin)
-    B = _bilinear(g.B, fu, fv, g.cell, g.origin)
-    inside = _bilinear(g.mask.astype(np.float32), fu, fv, g.cell,
+    # pattern/boundary sampled at the FOOT (u, v): this is the projection
+    # mapping — the pattern is printed vertically onto the surface, so rib
+    # width is constant by construction. Sampling at the normal-ray foot
+    # swept the sample point across the pattern on slopes and ribs bulged,
+    # twisted and ballooned at junctions in every transition band. The
+    # slope correction only compensates HEIGHT (normal standing height).
+    P = _bilinear(g.P, u, v, g.cell, g.origin)
+    B = _bilinear(g.B, u, v, g.cell, g.origin)
+    inside = _bilinear(g.mask.astype(np.float32), u, v, g.cell,
                        g.origin) > 0.5
     # beyond the raster there is no surface: cap the field as air there,
     # or marching cubes leaves open sheets at the sampling box walls
