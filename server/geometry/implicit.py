@@ -36,6 +36,11 @@ class FrameGrids:
     Sc: np.ndarray = None       # distance to the slope-cull band: ribs end
                                 # on a smooth offset of the band (ramp in
                                 # field()), not on the pixelated mask edge
+    Ds: np.ndarray = None       # gaussian-smoothed depth: rib TOPS follow
+                                # this (the raw raster is piecewise-linear
+                                # per cell — on slopes the top would
+                                # undulate with raster facets, reading as
+                                # terraced ribs); roots stay on raw D
     gate: np.ndarray = None     # (nlv, nu, nv) body-material lookup:
                                 # True where ribs/slab may exist at that
                                 # depth level (nTop-style body-field cut)
@@ -125,6 +130,17 @@ def field(u, v, d, grids, params):
                & (v <= g.origin[1] + (g.D.shape[1] - 1) * g.cell))
 
     height = np.float32(params.height)
+    if g.Ds is not None:
+        # tops ride the smoothed surface: raw D is piecewise-linear per
+        # raster cell, so on slopes the top plane undulates with raster
+        # facets and ribs read as terraced wax. Offset is clamped — near
+        # depth discontinuities (lips) the smoothing blends two levels.
+        # Applied BEFORE the run-out taper so a fully tapered edge still
+        # yields zero material. Roots/embed stay on raw D: no floating.
+        ds_off = _bilinear(g.Ds, u, v, g.cell, g.origin) - D
+        if g.Gu is not None:
+            ds_off = ds_off * c
+        height = height + np.clip(ds_off, -1.2, 1.2)
     if params.taper_len > 0 and not params.border:
         # the run-out ramp follows the OPEN boundary only: slope-cull rims
         # are interior transitions where retaining ribs meet lattice ribs
@@ -389,7 +405,7 @@ def mesh_field(grids, params, resolution, tile=192, reports=None):
     if not all_v:
         return []
     v, f = _weld(np.vstack(all_v).astype(np.float64), np.vstack(all_f))
-    v = _taubin(v, f)
+    v = _taubin(v, f, rounds=6)
     # per-component: drop marching-cubes crumbs (isolated slivers at steep
     # rims), orient each body outward by its own signed volume
     import scipy.sparse as sp
@@ -635,6 +651,8 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         np.hypot(Gu, Gv) > math.tan(math.radians(55.0)), iterations=2)
     Gu, Gv = make_gradients(D, cell, smooth_mm=1.5)
     Gm = np.hypot(Gu, Gv)
+    from scipy.ndimage import gaussian_filter as _gf
+    Ds = _gf(D, max(2.0, 1.5 / cell)).astype(np.float32)
     # columns whose front surface is backed by material within a few mm
     # along the view ray: the heightfield can be trusted there. Over
     # recess floors and past the silhouette the front-most depth is a lip
@@ -722,7 +740,7 @@ def build_rib_implicit(shape, face_ids, params, lin_defl=0.4, quality=1.0,
         f"{time.time() - t_gate:.0f}s")
 
     grids = FrameGrids(cell=cell, origin=origin, D=D, P=P, B=B, mask=mask,
-                       Gu=Gu, Gv=Gv, Gm=Gm, Bo=Bo, Sc=Sc, gate=gate,
+                       Gu=Gu, Gv=Gv, Gm=Gm, Bo=Bo, Sc=Sc, Ds=Ds, gate=gate,
                        gate_d0=g_d0, gate_dlv=g_dlv)
     warn = []
     clusters = mesh_field(grids, params, resolution=res, reports=warn)
