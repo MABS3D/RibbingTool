@@ -52,8 +52,16 @@ def _surface(pattern_dist, size=(40.0, 30.0), depth=10.0, slope=0.0,
     mask = np.ones((ru, rv), bool)
     dlo = np.full((ru, rv), float(zz.min()) - 3.0, np.float32)
     dhi = np.full((ru, rv), float(zz.max()) + 8.0, np.float32)
+    Pgu, Pgv = np.gradient(P, CELL)
+    # analytic plane normal, constant across the raster
+    npl = np.array([-slope, 0.0, 1.0]) / np.sqrt(1.0 + slope * slope)
     return SurfaceField(cell=CELL, origin=(0.0, 0.0), P=P, B=B, mask=mask,
-                        Bo=B.copy(), V=V, F=F, N=N, dlo=dlo, dhi=dhi)
+                        Bo=B.copy(), V=V, F=F, N=N, dlo=dlo, dhi=dhi,
+                        Pgu=Pgu.astype(np.float32),
+                        Pgv=Pgv.astype(np.float32),
+                        NXr=np.full((ru, rv), npl[0], np.float32),
+                        NYr=np.full((ru, rv), npl[1], np.float32),
+                        NZr=np.full((ru, rv), npl[2], np.float32))
 
 
 def _volume(clusters):
@@ -132,6 +140,114 @@ def test_taper_follows_boundary_ramp():
         allowed = 4.0 * frac
         assert top <= allowed + 0.35, f"u [{u0},{u1}): {top} > {allowed}"
     assert v[:, 2].max() == pytest.approx(14.0, abs=0.3)   # full height hit
+
+
+def test_taper_runout_is_surface_length_on_slope():
+    # taper_len is a SURFACE run-out length.  B is measured in PROJECTED
+    # mm, and a slope stretches every projected mm by 1/cos on the
+    # surface: uncorrected, a 60-degree slope turns an 8mm run-out into a
+    # 16mm fan of pointed stubs (the user's fern band).  With the facing
+    # compensation the ramp must complete within ~taper_len of PROJECTED
+    # distance scaled by cos(slope).
+    slope = 1.7320508                       # 60 degrees: cos = 0.5
+    def surface():
+        g = _surface(lambda uu, vv: np.abs(vv - 15.0), slope=slope)
+        nu = g.B.shape[0]
+        ramp = (np.arange(nu, dtype=np.float32) * CELL)[:, None] \
+            * np.ones_like(g.B)
+        g.B = ramp
+        g.Bo = ramp.copy()
+        return g
+    p = _params(taper_len=8.0)
+    clusters = mesh_field(surface(), p, resolution=CELL)
+    assert _watertight(clusters)
+    v = np.vstack([c[0] for c in clusters])
+    import igl
+    g = surface()
+    sq, _, Cp = igl.point_mesh_squared_distance(
+        np.ascontiguousarray(v), g.V, g.F)
+    h = np.sqrt(sq)
+    # window on the FOOT (closest surface point) u — rib tops lean along
+    # the tilted normal, so windowing on the vertex u lets tops rooted
+    # farther up the ramp leak in.  Ramp must COMPLETE by foot-u ~
+    # taper*cos(60)=4mm (+slack); uncorrected it is only at
+    # 4*(4.3..5.3)/8 = 2.2..2.7mm there.
+    m = (Cp[:, 0] >= 4.3) & (Cp[:, 0] < 5.3) & (h > 0.3)
+    assert m.any()
+    assert h[m].max() > 0.85 * 4.0, \
+        f"run-out still ramping at foot 4.3-5.3mm: max h {h[m].max():.2f}"
+
+
+def test_rib_width_is_surface_metric_on_slope():
+    # the wall cut P < thickness/2 is a PROJECTED band: a rib crossing a
+    # 60-degree slope stretches to thickness/cos(60) = 2x width on the
+    # surface (wide flat leaves with staircase tops — the user's fern).
+    # With the metric correction the SURFACE width is thickness, so the
+    # PROJECTED width must be thickness*cos(60) = 0.8mm.
+    slope = 1.7320508                       # 60 degrees along u
+    def surface():
+        # one rib along v at u=20: its perpendicular IS the fall line
+        return _surface(lambda uu, vv: np.abs(uu - 20.0), slope=slope)
+    p = _params()
+    clusters = mesh_field(surface(), p, resolution=CELL)
+    assert _watertight(clusters)
+    v = np.vstack([c[0] for c in clusters])
+    import igl
+    g = surface()
+    sq, _, _ = igl.point_mesh_squared_distance(
+        np.ascontiguousarray(v), g.V, g.F)
+    h = np.sqrt(sq)
+    # wall band: a THIN height slice (the rib leans along the tilted
+    # normal — a tall slice conflates lean with width), mid-domain in v
+    m = (h > 1.35) & (h < 1.65) & (v[:, 1] > 8) & (v[:, 1] < 22)
+    assert m.sum() > 50
+    width = np.percentile(v[m, 0], 98) - np.percentile(v[m, 0], 2)
+    # projected width must be ~thickness*cos(60)=0.8 (+lean of the slice
+    # 0.26 + voxel slack), NOT the uncorrected 1.6+lean=1.9
+    assert width < 1.35, \
+        f"rib projected width {width:.2f}mm — stretched on the slope"
+
+
+def test_lean_cap_over_mask_holes():
+    # blades on a slope lean sideways over openings by height*sin(slope);
+    # the Bv lean cap trims them ~1.6mm past the domain edge so windows
+    # stay clear.  Self-validating: without Bv the same build leans deep
+    # into the hole.
+    from scipy.ndimage import distance_transform_edt
+    slope = 1.0                              # 45 degrees along u
+
+    def surface(with_bv):
+        g = _surface(lambda uu, vv: np.abs(vv - 15.0), slope=slope)
+        # punch a mask hole DOWNSLOPE of the rib's crossing
+        i0 = int(22.0 / CELL)
+        i1 = int(34.0 / CELL)
+        j0 = int(9.0 / CELL)
+        j1 = int(21.0 / CELL)
+        g.mask[i0:i1, j0:j1] = False
+        g.B[i0:i1, j0:j1] = 0.0
+        if with_bv:
+            g.Bv = (distance_transform_edt(~g.mask) * CELL).astype(
+                np.float32)
+        return g
+
+    def penetration(g):
+        # depth into the hole = distance to the NEAREST rim (material may
+        # legitimately fringe ~1.6mm along every rim)
+        clusters = mesh_field(g, _params(), resolution=CELL)
+        v = np.vstack([c[0] for c in clusters])
+        m = (v[:, 0] > 22.0) & (v[:, 0] < 34.0) & (v[:, 1] > 9.0) \
+            & (v[:, 1] < 21.0)
+        if not m.any():
+            return 0.0
+        din = np.minimum.reduce([v[m, 0] - 22.0, 34.0 - v[m, 0],
+                                 v[m, 1] - 9.0, 21.0 - v[m, 1]])
+        return float(din.max())
+
+    deep = penetration(surface(False))
+    capped = penetration(surface(True))
+    assert deep > 2.4, f"fixture does not lean ({deep:.2f}mm) — dead test"
+    assert capped < 2.3, \
+        f"lean cap failed: {capped:.2f}mm into the mask hole"
 
 
 def test_slope_ribs_extrude_along_surface_normal():

@@ -1,18 +1,38 @@
-import { initViewer, loadModel, onPick, getSelection, clearSelection,
+import { initViewer, loadModel, clearModel, onPick, getSelection, clearSelection,
          setSelection, listFaces, lookAtFace, snapshot } from './viewer.js';
+import { createMappingEditor } from './mapping-editor.js';
 
 const $ = (id) => document.getElementById(id);
 const banner = $('banner');
 const busy = $('busy');
+let mappingEditor = null;
+let operationBusy = false;
+let updatingModel = false;
+let modelToken = null;
+let modelRevision = 0;
 
 initViewer($('view'));
+
+function updateGraphControls() {
+  const active = ['surface', 'project'].includes($('mapping').value)
+    && ['auto', 'graph'].includes($('engine').value);
+  $('fillet-junction').disabled = !active;
+  $('guide-smoothing').disabled = !active;
+}
+$('mapping').addEventListener('change', updateGraphControls);
+$('engine').addEventListener('change', updateGraphControls);
+updateGraphControls();
 
 let modelLoaded = false;
 let canUndo = false;
 
 function setBusy(on, msg = 'working...') {
+  operationBusy = on;
   $('busy-msg').textContent = msg;
   busy.classList.toggle('on', on);
+  $('panel').inert = on;
+  mappingEditor?.setBusy(on);
+  refreshButtons();
 }
 
 function note(kind, text) {
@@ -20,33 +40,94 @@ function note(kind, text) {
   banner.textContent = text;
 }
 
-function refreshButtons() {
-  const sel = getSelection();
-  $('btn-apply').disabled = !modelLoaded || sel.length === 0;
-  $('btn-undo').disabled = !canUndo;
-  $('btn-step').disabled = !modelLoaded;
-  $('btn-stl').disabled = !modelLoaded;
+// --- live apply progress (poll /api/apply_progress at 2 Hz) -------------
+let progressTimer = null;
+
+function renderProgress(p) {
+  if (!p.active) return;               // keep the last frame; stopProgress clears
+  $('progress').classList.add('on');
+  const fill = $('progress-fill');
+  const secs = Math.round(p.elapsed);
+  if (p.total > 0) {
+    fill.classList.remove('indet');
+    fill.style.width = `${Math.round(100 * p.done / p.total)}%`;
+    $('progress-label').textContent = `${p.stage} ${p.done}/${p.total} · ${secs}s`;
+  } else {
+    fill.classList.add('indet');       // no total: indeterminate shimmer
+    fill.style.width = '40%';
+    $('progress-label').textContent = `${p.stage} · ${secs}s`;
+  }
 }
 
-onPick((sel, last) => {
+function startProgress() {
+  stopProgress();
+  progressTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/apply_progress');
+      if (r.ok) renderProgress(await r.json());
+    } catch (err) { /* poll failures are non-fatal; keep the last frame */ }
+  }, 500);
+}
+
+function stopProgress() {
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  $('progress').classList.remove('on');
+  $('progress-fill').classList.remove('indet');
+  $('progress-fill').style.width = '0';
+  $('progress-label').textContent = '';
+}
+
+function refreshButtons() {
+  const sel = getSelection();
+  const locked = operationBusy || !!mappingEditor?.isPreviewRunning();
+  $('btn-apply').disabled = locked || !modelLoaded || sel.length === 0 || (mappingEditor && !mappingEditor.canApply());
+  $('btn-undo').disabled = locked || !canUndo;
+  $('btn-step').disabled = locked || !modelLoaded;
+  $('btn-stl').disabled = locked || !modelLoaded;
+  $('file-input').disabled = locked;
+  $('btn-unload').disabled = locked || !modelLoaded;
+  $('btn-grow').disabled = locked || !sel.length;
+  $('btn-clear').disabled = operationBusy;
+}
+
+function updateSelectionInfo(sel, last) {
+  $('sel-info').title = sel.join(', ');
   if (sel.length === 0) {
     $('sel-info').textContent = 'no faces selected';
   } else {
-    let txt = `<b>${sel.length}</b> face${sel.length > 1 ? 's' : ''}: ${sel.join(', ')}`;
+    const shown = sel.slice(0, 12).join(', ') + (sel.length > 12 ? ', …' : '');
+    let txt = `<b>${sel.length}</b> face${sel.length > 1 ? 's' : ''}: ${shown}`;
     if (last) {
       txt += `<br>last: #${last.faceId} (${last.kind}, ${last.area.toFixed(0)} mm2)`;
     }
     $('sel-info').innerHTML = txt;
   }
   refreshButtons();
+}
+
+onPick((sel, last) => {
+  if (updatingModel) return;
+  updateSelectionInfo(sel, last);
+  mappingEditor?.selectionChanged();
 });
 
-function applyModel(data) {
-  loadModel(data);
+function applyModel(data, { preserve = false, selection = null } = {}) {
+  modelRevision += 1;
+  updatingModel = true;
+  loadModel(data, { preserveCamera: preserve });
   modelLoaded = true;
+  modelToken = data.model_token;
   canUndo = !!data.can_undo;
   $('model-info').textContent =
     `${data.filename} - ${data.nfaces} faces, ${(data.volume / 1000).toFixed(1)} cm3`;
+  mappingEditor?.modelLoaded(data, { preserve });
+  if (selection) {
+    const valid = new Set(data.faces.map(f => f.id));
+    setSelection(selection.filter(id => valid.has(id)));
+  }
+  updatingModel = false;
+  updateSelectionInfo(getSelection(), null);
+  mappingEditor?.refresh();
   refreshButtons();
 }
 
@@ -70,6 +151,40 @@ $('file-input').addEventListener('change', async (e) => {
   }
 });
 
+function clearLoadedModel() {
+  modelRevision += 1;
+  updatingModel = true;
+  modelLoaded = false;
+  modelToken = null;
+  canUndo = false;
+  mappingEditor?.modelCleared();
+  clearModel();
+  $('file-input').value = '';
+  $('model-info').textContent = 'no model loaded';
+  stopProgress();
+  updatingModel = false;
+  updateSelectionInfo([], null);
+  refreshButtons();
+}
+
+$('btn-unload').addEventListener('click', async () => {
+  if (!modelLoaded || operationBusy || mappingEditor?.isPreviewRunning()) return;
+  setBusy(true, 'closing model...');
+  try {
+    const response = await fetch('/api/unload', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_token: modelToken }),
+    });
+    if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+    clearLoadedModel();
+    note('', '');
+  } catch (err) {
+    note('err', 'could not close model: ' + err.message);
+  } finally {
+    setBusy(false);
+  }
+});
+
 function gatherParams() {
   const num = (id) => { const v = $(id).value; return v === '' ? null : Number(v); };
   return {
@@ -88,40 +203,68 @@ function gatherParams() {
     taper_len: num('taper'),
     fillet_root: num('fillet-root'),
     fillet_top: num('fillet-top'),
+    fillet_junction: num('fillet-junction'),
+    guide_smoothing: num('guide-smoothing'),
     density: num('density'),
     seed: num('seed'),
+    mapping_controls: mappingEditor?.getControls() || [],
   };
+}
+
+function restoreParams(params) {
+  const fields = { pattern: 'pattern', mapping: 'mapping', spacing: 'spacing',
+    spacing_y: 'spacing-y', thickness: 'thickness', height: 'height',
+    orientation_deg: 'orientation', offset_x: 'offset-x', offset_y: 'offset-y',
+    draft_deg: 'draft', margin: 'margin', taper_len: 'taper', fillet_root: 'fillet-root',
+    fillet_top: 'fillet-top', fillet_junction: 'fillet-junction',
+    guide_smoothing: 'guide-smoothing', density: 'density', seed: 'seed' };
+  for (const [key, id] of Object.entries(fields)) {
+    if (!(key in params)) continue;
+    const el = $(id), value = params[key];
+    if (el.tagName === 'SELECT') {
+      if ([...el.options].some(o => o.value === value)) el.value = value;
+    } else if (value === null && key === 'spacing_y') el.value = '';
+    else if (typeof value === 'number' && Number.isFinite(value)) el.value = value;
+  }
+  if (typeof params.border === 'boolean') $('border').checked = params.border;
+  $('engine').value = 'auto';
+  updateGraphControls();
 }
 
 $('btn-apply').addEventListener('click', async () => {
   const face_ids = getSelection();
   if (!face_ids.length) return;
   setBusy(true, `building ribs on ${face_ids.length} face(s)... this can take a minute`);
+  startProgress();
   note('', '');
   try {
     const r = await fetch('/api/ribs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ face_ids, params: gatherParams(),
-                             engine: $('engine').value }),
+                             engine: $('engine').value, model_token: modelToken }),
     });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const data = await r.json();
-    applyModel(data);
+    applyModel(data, { preserve: data.engine === 'graph',
+                       selection: data.engine === 'graph' ? face_ids : null });
     const lines = [`engine: ${data.engine}`];
     for (const rep of data.reports) {
-      let l = `face ${rep.face_id}: ${rep.lofted}/${rep.segments} ribs built`;
+      let l = data.engine === 'graph'
+        ? `${rep.lofted} rib paths on ${rep.face_ids.length} selected face(s)`
+        : `face ${rep.face_id}: ${rep.lofted}/${rep.segments} ribs built`;
       if (rep.skipped) l += ` (${rep.skipped} skipped)`;
       lines.push(l);
       for (const w of rep.warnings) lines.push('! ' + w);
     }
     if (data.overlay_count > 0) {
-      lines.push('note: fast engine active - exports will be faceted (STL + faceted STEP)');
+      lines.push('exports: STL and faceted STEP (triangulated surfaces)');
     }
     note('ok', lines.join('\n'));
   } catch (err) {
     note('err', 'ribbing failed: ' + err.message);
   } finally {
+    stopProgress();
     setBusy(false);
     refreshButtons();
   }
@@ -132,7 +275,7 @@ $('btn-undo').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/undo', { method: 'POST' });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    applyModel(await r.json());
+    applyModel(await r.json(), { preserve: true, selection: getSelection() });
     note('ok', 'reverted');
   } catch (err) {
     note('err', 'undo failed: ' + err.message);
@@ -193,7 +336,53 @@ $('btn-grow').addEventListener('click', async () => {
 });
 
 $('btn-clear').addEventListener('click', () => clearSelection());
-$('btn-step').addEventListener('click', () => { window.location = '/api/export/step'; });
-$('btn-stl').addEventListener('click', () => { window.location = '/api/export/stl'; });
+async function exportModel(extension) {
+  if (!modelLoaded || operationBusy || mappingEditor?.isPreviewRunning()) return;
+  setBusy(true, `preparing ${extension.toUpperCase()} export...`);
+  note('', '');
+  try {
+    const response = await fetch(`/api/export/${extension}`);
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new Error(error?.detail || response.statusText);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const quotedName = disposition.match(/filename="([^"]+)"/i);
+    const filename = encodedName ? decodeURIComponent(encodedName[1])
+      : quotedName?.[1] || `ribbingtool_export.${extension}`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    note('ok', `${extension.toUpperCase()} export ready`);
+  } catch (err) {
+    note('err', 'export failed: ' + err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+$('btn-step').addEventListener('click', () => exportModel('step'));
+$('btn-stl').addEventListener('click', () => exportModel('stl'));
+
+mappingEditor = createMappingEditor({ getSelection, setSelection, getParams: gatherParams,
+  setParams: restoreParams, getEngine: () => $('engine').value, refreshButtons });
+for (const el of document.querySelectorAll('#panel input, #panel select')) {
+  if (el.closest('#mapping-studio') || ['file-input', 'grow-angle'].includes(el.id)) continue;
+  el.addEventListener('change', () => mappingEditor.paramsChanged());
+}
 
 refreshButtons();
+
+// A browser refresh resumes the server's model and the draft for that exact STEP.
+const resumeRevision = modelRevision;
+fetch('/api/model').then(async response => {
+  if (!response.ok) return;
+  const data = await response.json();
+  if (resumeRevision === modelRevision && !modelLoaded && !operationBusy) applyModel(data);
+}).catch(() => { /* Server may still be starting. File upload remains available. */ });

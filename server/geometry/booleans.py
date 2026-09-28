@@ -40,7 +40,8 @@ def fuse(a, b):
 # --- mesh-boolean fallback (manifold3d) -------------------------------------
 
 def _shape_to_mesh(shape, lin_defl):
-    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from .cad_tessellation import tessellate_shape
+    from .meshing import _edge_node_pairs
     from OCP.BRep import BRep_Tool
     from OCP.BRepTools import BRepTools
     from OCP.TopLoc import TopLoc_Location
@@ -52,17 +53,19 @@ def _shape_to_mesh(shape, lin_defl):
     # stale cached triangulations create T-vertices where one face kept a
     # coarser mesh than its neighbor — remesh everything consistently
     BRepTools.Clean_s(shape)
-    BRepMesh_IncrementalMesh(shape, lin_defl, False, 0.4, True)
+    tessellate_shape(shape, lin_defl, 0.4)
     fm = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(shape, TopAbs_FACE, fm)
-    V, F = [], []
+    V, F, missing, selected = [], [], [], {}
     for i in range(1, fm.Size() + 1):
         face = TopoDS.Face_s(fm.FindKey(i))
         loc = TopLoc_Location()
         tri = BRep_Tool.Triangulation_s(face, loc)
-        if tri is None:
+        if tri is None or tri.NbTriangles() == 0:
+            missing.append(i)
             continue
         base = len(V)
+        selected[i] = (face, base)
         tr = loc.Transformation()
         for k in range(1, tri.NbNodes() + 1):
             p = tri.Node(k).Transformed(tr)
@@ -72,7 +75,28 @@ def _shape_to_mesh(shape, lin_defl):
             a, b, c = tri.Triangle(k).Get()
             F.append((base + a - 1, base + c - 1, base + b - 1) if rev
                      else (base + a - 1, base + b - 1, base + c - 1))
-    return np.array(V, np.float64), np.array(F, np.int64)
+    if missing:
+        ids = ', '.join(map(str, missing[:20]))
+        if len(missing) > 20:
+            ids += f', ... ({len(missing)} total)'
+        raise BooleanError(
+            f'CAD tessellation is incomplete: body faces {ids} have no usable triangles. '
+            'Export aborted to avoid writing a body with missing surfaces.')
+    # Shared CAD edges are a stronger identity than rounded coordinates.
+    # Toleranced vertices can legitimately differ between face polygons;
+    # weld the corresponding edge nodes before the residual geometric weld.
+    parent = np.arange(len(V))
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for a, b in _edge_node_pairs(shape, fm, selected):
+        a, b = root(a), root(b)
+        if a != b:
+            parent[b] = a
+    remap = np.array([root(i) for i in range(len(V))])
+    return np.array(V, np.float64), remap[np.array(F, np.int64)]
 
 
 def _weld(v, f, tol=1e-6):
@@ -163,9 +187,23 @@ def _repair_boundary(v, f, tol=1e-3, rounds=4):
 
 def _to_manifold(shape, lin_defl):
     import manifold3d as m3d
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    solids = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, TopAbs_SOLID, solids)
+    if solids.Size() > 1:
+        # Assemblies can have coincident contact faces. Welding their raw
+        # triangles together creates non-manifold edges; union closed solids.
+        parts = [_to_manifold(solids.FindKey(i), lin_defl) for i in range(1, solids.Size()+1)]
+        result = m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
+        if result.is_empty() or result.status() != m3d.Error.NoError:
+            raise BooleanError('assembly mesh union failed')
+        return result
     v, f = _weld(*_shape_to_mesh(shape, lin_defl))
     v, f = _repair_boundary(v, f)
-    mesh = m3d.Mesh(v.astype(np.float32), f.astype(np.uint32))
+    mesh = m3d.Mesh64(np.ascontiguousarray(v, np.float64),
+                      np.ascontiguousarray(f, np.uint64))
     man = m3d.Manifold(mesh)
     if man.is_empty():
         raise BooleanError("mesh is not manifold — fallback impossible")
@@ -175,12 +213,23 @@ def _to_manifold(shape, lin_defl):
 def _man_to_arrays(man, simplify_tol):
     if simplify_tol:
         try:
-            man = man.simplify(simplify_tol)
+            count = len(man.decompose())
+            # Decimation can pinch off a tiny rib contact even though
+            # both meshes remain manifold. Preserve component topology;
+            # retry more conservatively, then keep the unsimplified mesh.
+            for tolerance in (simplify_tol, simplify_tol / 2.0):
+                reduced = man.simplify(tolerance)
+                if not reduced.is_empty() and len(reduced.decompose()) == count:
+                    man = reduced
+                    break
         except Exception:
             pass
-    mesh = man.to_mesh()
-    return (np.asarray(mesh.vert_properties, np.float64)[:, :3],
-            np.asarray(mesh.tri_verts, np.int64))
+    # Keep double precision through the whole boolean round-trip. A
+    # float32 conversion can collapse thin features or separate contacts.
+    mesh = man.to_mesh64()
+    return (np.array(mesh.vert_properties[:, :3], dtype=np.float64,
+                     order="C", copy=True),
+            np.array(mesh.tri_verts, dtype=np.int64, order="C", copy=True))
 
 
 def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
@@ -198,13 +247,12 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
     except BooleanError:
         pass
     rib_mans = []
-    raw_shells = []
-    for s in rib_solids:
+    for rib_index, s in enumerate(rib_solids, 1):
         try:
             if isinstance(s, tuple):
                 v, f = s   # watertight cluster mesh, indices already shared
-                mesh = m3d.Mesh(np.ascontiguousarray(v, np.float32),
-                                np.ascontiguousarray(f, np.uint32))
+                mesh = m3d.Mesh64(np.ascontiguousarray(v, np.float64),
+                                  np.ascontiguousarray(f, np.uint64))
                 man = m3d.Manifold(mesh)
                 if man.is_empty():
                     # implicit-engine meshes can carry marching-cubes
@@ -215,23 +263,23 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
                     except Exception:
                         pass
                 if man.is_empty():
-                    # never drop geometry: export the lattice as its own
-                    # shell — slicers merge overlapping shells natively
-                    raw_shells.append((np.asarray(v, np.float64),
-                                       np.asarray(f, np.int64)))
-                    continue
+                    raise BooleanError(
+                        f"rib cluster {rib_index} is not a closed manifold "
+                        f"solid ({man.status()}); export aborted")
                 rib_mans.append(man)
             else:
                 rib_mans.append(_to_manifold(s, lin_defl))
-        except Exception:
-            continue
-    if not rib_mans and body_man is None and not raw_shells:
+        except BooleanError:
+            raise
+        except Exception as e:
+            raise BooleanError(f"cannot mesh rib cluster {rib_index}: {e}") from e
+    if not rib_mans and body_man is None:
         raise BooleanError("no meshable geometry to union")
 
     if body_man is not None:
         man = m3d.Manifold.batch_boolean([body_man] + rib_mans, m3d.OpType.Add)
         if not man.is_empty():
-            return [_man_to_arrays(man, simplify_tol)] + raw_shells
+            return [_man_to_arrays(man, simplify_tol)]
 
     shells = []
     v, f = _weld(*_shape_to_mesh(body_shape, lin_defl))
@@ -243,7 +291,7 @@ def mesh_union(body_shape, rib_solids, lin_defl=0.25, simplify_tol=0.02):
         else:
             for rm in rib_mans:
                 shells.append(_man_to_arrays(rm, None))
-    return shells + raw_shells
+    return shells
 
 
 def mesh_fallback_fuse(body_shape, rib_solids, lin_defl=0.5,

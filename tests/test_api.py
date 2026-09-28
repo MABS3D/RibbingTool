@@ -48,13 +48,13 @@ def test_engine_routing(box_step):
     c = TestClient(app)
     d0 = _load(c, box_step)
     big = max(d0["faces"], key=lambda f: f["area"])["id"]
-    # projected mapping routes auto -> implicit (the SDF kernel)
+    # projected mapping routes auto -> explicit surface graph
     r = c.post("/api/ribs", json={
         "face_ids": [big],
         "params": {"pattern": "quadmesh", "spacing": 12,
                    "mapping": "project"}})
     assert r.status_code == 200, r.text
-    assert r.json()["engine"] == "implicit"
+    assert r.json()["engine"] == "graph"
     c.post("/api/undo")
     # implicit + unfold is a clear client error
     r = c.post("/api/ribs", json={"face_ids": [big], "engine": "implicit",

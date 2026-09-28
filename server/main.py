@@ -1,18 +1,26 @@
 import base64
 import io
+import hashlib
 import struct
 import tempfile
+import time
+import threading
+import uuid
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .geometry.booleans import BooleanError, _shape_to_mesh, mesh_union
+from .geometry.booleans import BooleanError, _shape_to_mesh, _to_manifold, _man_to_arrays, mesh_union
+from .geometry.export_mesh import stl_export_mesh
 from .geometry.flatten import FlattenError
 from .geometry.implicit import build_rib_implicit
+from .geometry.graph_ribs import build_rib_graph, preview_rib_graph
 from .geometry.meshing import mesh_shape
 from .geometry.patterns import RibParams
 from .geometry.ribbing import (
@@ -45,17 +53,48 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 #   shape:   B-rep body (never modified by the fast engine)
 #   overlay: list of un-fused rib solids sitting on the body (fast engine)
 # frame_cache keeps projected applies on one lattice frame per model.
-STATE = {"stack": [], "filename": None, "meshes": None, "frame_cache": {}}
+STATE = {"stack": [], "filename": None, "meshes": None, "frame_cache": {},
+         "model_token": None, "model_fingerprint": None}
+
+# FastAPI runs synchronous handlers in a thread pool. Mapping previews and
+# model operations share OCCT objects and caches, so never run them together.
+MODEL_LOCK = threading.Lock()
+
+
+@contextmanager
+def _model_access():
+    if not MODEL_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "model busy; wait for the current operation to finish")
+    try:
+        yield
+    finally:
+        MODEL_LOCK.release()
+
+
+def _model_operation(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with _model_access():
+            return fn(*args, **kwargs)
+    return guarded
+
+# Progress remains readable while the model lock is held by a build.
+PROGRESS = {"stage": "", "done": 0, "total": 0, "t0": 0.0, "active": False}
 
 
 class RibsRequest(BaseModel):
     face_ids: list[int]
     params: dict = {}
-    engine: str = "auto"          # auto | fast | exact
+    engine: str = "auto"          # auto | graph | implicit | fast | exact
+    model_token: str | None = None
 
 
 class LoadPathRequest(BaseModel):
     path: str
+
+
+class UnloadRequest(BaseModel):
+    model_token: str | None = None
 
 
 class GrowRequest(BaseModel):
@@ -65,6 +104,22 @@ class GrowRequest(BaseModel):
 
 def _entry():
     return STATE["stack"][-1]
+
+
+def _request_params(req):
+    if not STATE["stack"]:
+        raise HTTPException(400, "no model loaded")
+    if req.model_token is not None and req.model_token != STATE["model_token"]:
+        raise HTTPException(409, "the model changed; reload it before continuing")
+    if not req.face_ids:
+        raise HTTPException(400, "no faces selected")
+    valid = {m.face_id for m in (STATE["meshes"] or [])}
+    if set(req.face_ids) - valid:
+        raise HTTPException(400, "selection contains faces outside the current model")
+    try:
+        return RibParams.from_dict(req.params)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, f"invalid parameters: {e}") from e
 
 
 def _overlay_mesh(overlay, lin_defl=0.35):
@@ -97,31 +152,46 @@ def _overlay_mesh(overlay, lin_defl=0.35):
 def _mesh_payload():
     entry = _entry()
     shape = entry["shape"]
-    meshes = mesh_shape(shape, 0.5, 0.5)
-    STATE["meshes"] = meshes
-    faces = []
-    for m in meshes:
-        faces.append({
+    # Graph applies leave the CAD body unchanged. Keep one display snapshot
+    # per body instead of re-tessellating/flattening it after every apply.
+    # Holding the object itself avoids identity reuse after a model reload.
+    cache = STATE["frame_cache"]
+    body = cache.get("display_body")
+    if body is None or body["shape"] is not shape:
+        meshes = mesh_shape(shape, 0.5, 0.5)
+        faces = [{
             "id": m.face_id,
             "kind": m.surface_kind,
             "planar": m.is_planar,
             "area": float(m.area),
             "positions": np.round(m.vertices, 4).ravel().tolist(),
             "indices": m.triangles.ravel().tolist(),
-        })
-    if meshes:
-        allv = np.vstack([m.vertices for m in meshes])
-        bbox = [*allv.min(0).tolist(), *allv.max(0).tolist()]
-    else:
-        bbox = [0, 0, 0, 0, 0, 0]
+        } for m in meshes]
+        if meshes:
+            allv = np.vstack([m.vertices for m in meshes])
+            bbox = [*allv.min(0).tolist(), *allv.max(0).tolist()]
+        else:
+            bbox = [0, 0, 0, 0, 0, 0]
+        body = {"shape": shape, "meshes": meshes, "faces": faces,
+                "bbox": bbox, "volume": float(shape_volume(shape))}
+        cache["display_body"] = body
+    STATE["meshes"] = body["meshes"]
+    # Stack entries are immutable geometry snapshots. Retain only the current
+    # overlay payload, so ten undo states do not also retain ten JSON meshes.
+    display = cache.get("display_overlay")
+    if display is None or display["entry"] is not entry:
+        display = {"entry": entry, "overlay": _overlay_mesh(entry["overlay"])}
+        cache["display_overlay"] = display
     return {
         "filename": STATE["filename"],
-        "nfaces": len(faces),
-        "faces": faces,
-        "volume": float(shape_volume(shape)),
-        "bbox": bbox,
+        "model_token": STATE["model_token"],
+        "model_fingerprint": STATE["model_fingerprint"],
+        "nfaces": len(body["faces"]),
+        "faces": body["faces"],
+        "volume": body["volume"],
+        "bbox": body["bbox"],
         "can_undo": len(STATE["stack"]) > 1,
-        "overlay": _overlay_mesh(entry["overlay"]),
+        "overlay": display["overlay"],
         "overlay_count": len(entry["overlay"]),
     }
 
@@ -133,10 +203,12 @@ def _push(shape, overlay, recipes):
         STATE["stack"] = STATE["stack"][:1] + STATE["stack"][-9:]
 
 
-def _load_shape(shape, filename):
+def _load_shape(shape, filename, fingerprint=None):
     STATE["stack"] = [{"shape": shape, "overlay": [], "recipes": []}]
     STATE["filename"] = filename
     STATE["frame_cache"] = {}
+    STATE["model_token"] = uuid.uuid4().hex
+    STATE["model_fingerprint"] = fingerprint
     return _mesh_payload()
 
 
@@ -148,26 +220,51 @@ async def api_load(file: UploadFile = File(...)):
         with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tf:
             tf.write(data)
             tmp = tf.name
-        shape = load_step(tmp)
+        with _model_access():
+            shape = load_step(tmp)
+            payload = _load_shape(shape, file.filename, hashlib.sha256(data).hexdigest())
     except StepError as e:
         raise HTTPException(400, str(e))
     finally:
         if tmp:
             Path(tmp).unlink(missing_ok=True)
-    return _load_shape(shape, file.filename)
+    return JSONResponse(payload)
 
 
 @app.post("/api/load_path")
+@_model_operation
 def api_load_path(req: LoadPathRequest):
     """Load a STEP file from a local path (local single-user tool)."""
     try:
         shape = load_step(req.path)
     except StepError as e:
         raise HTTPException(400, str(e))
-    return _load_shape(shape, Path(req.path).name)
+    return JSONResponse(_load_shape(
+        shape, Path(req.path).name,
+        hashlib.sha256(Path(req.path).read_bytes()).hexdigest()))
+
+
+@app.get("/api/model")
+@_model_operation
+def api_model():
+    if not STATE["stack"]:
+        raise HTTPException(400, "no model loaded")
+    return JSONResponse(_mesh_payload())
+
+
+@app.post("/api/unload")
+@_model_operation
+def api_unload(req: UnloadRequest | None = None):
+    if req is not None and req.model_token is not None and req.model_token != STATE["model_token"]:
+        raise HTTPException(409, "the model changed; reload it before closing")
+    STATE.update(stack=[], filename=None, meshes=None, frame_cache={},
+                 model_token=None, model_fingerprint=None)
+    PROGRESS.update(stage="", done=0, total=0, t0=0.0, active=False)
+    return {"unloaded": True}
 
 
 @app.post("/api/grow")
+@_model_operation
 def api_grow(req: GrowRequest):
     if not STATE["stack"]:
         raise HTTPException(400, "no model loaded")
@@ -182,24 +279,52 @@ def api_grow(req: GrowRequest):
     return {"face_ids": grown}
 
 
+@app.post("/api/mapping/preview")
+@_model_operation
+def api_mapping_preview(req: RibsRequest):
+    params = _request_params(req)
+    if req.engine not in ("auto", "graph") or params.mapping not in ("surface", "project"):
+        raise HTTPException(400, "mapping preview requires Surface or Project with auto or surface graph engine")
+    try:
+        payload = preview_rib_graph(_entry()["shape"], req.face_ids, params,
+                                    frame_cache=STATE["frame_cache"])
+    except (RibbingError, FlattenError, BooleanError, StepError, ValueError, TypeError) as e:
+        raise HTTPException(400, str(e)) from e
+    payload["model_token"] = STATE["model_token"]
+    return JSONResponse(payload)
+
+
 @app.post("/api/ribs")
+@_model_operation
 def api_ribs(req: RibsRequest):
-    if not STATE["stack"]:
-        raise HTTPException(400, "no model loaded")
+    params = _request_params(req)
     entry = _entry()
-    params = RibParams.from_dict(req.params)
 
     engine = req.engine
-    if engine not in ("auto", "implicit", "fast", "exact"):
+    if engine not in ("auto", "graph", "implicit", "fast", "exact"):
         raise HTTPException(400, f"unknown engine: {engine}")
+    if params.mapping not in ("surface", "project", "unfold"):
+        raise HTTPException(400, f"unknown mapping: {params.mapping}")
+    if params.mapping == "surface" and engine not in ("auto", "graph"):
+        raise HTTPException(400, "surface mapping requires auto or surface graph engine")
+    if params.mapping_controls and (params.mapping != "surface" or engine not in ("auto", "graph")):
+        raise HTTPException(400, "local mapping controls require Surface with auto or surface graph engine")
     if engine == "auto":
-        if params.mapping == "project":
-            engine = "implicit"       # the SDF kernel owns projected applies
+        if params.mapping in ("surface", "project"):
+            engine = "graph"
         else:
             by_id = {m.face_id: m for m in (STATE["meshes"] or [])}
             all_planar = all(by_id[f].is_planar
                              for f in req.face_ids if f in by_id)
             engine = "exact" if all_planar else "fast"
+
+    PROGRESS.update(stage="starting", done=0, total=0, t0=time.time(),
+                    active=True)
+
+    def _report(stage, done, total):
+        PROGRESS["stage"] = stage
+        PROGRESS["done"] = done
+        PROGRESS["total"] = total
 
     try:
         if engine == "exact":
@@ -208,29 +333,48 @@ def api_ribs(req: RibsRequest):
             welded = fuse_into(entry["shape"], entry["overlay"] + solids, reports)
             _push(welded, [], [])
         else:
-            build = (build_rib_implicit if engine == "implicit"
-                     else build_rib_meshes)
+            build = {"graph": build_rib_graph, "implicit": build_rib_implicit,
+                     "fast": build_rib_meshes}[engine]
+            kwargs = {"frame_cache": STATE["frame_cache"]}
+            if engine in ("graph", "implicit"):
+                kwargs["progress"] = _report    # only the field engine reports
             clusters, reports = build(entry["shape"], req.face_ids, params,
-                                      frame_cache=STATE["frame_cache"])
+                                      **kwargs)
             _push(entry["shape"], entry["overlay"] + clusters,
                   entry["recipes"] + [{"face_ids": list(req.face_ids),
                                        "params": dict(req.params),
                                        "engine": engine}])
-    except (RibbingError, FlattenError, BooleanError, StepError, ValueError) as e:
+        _report("preparing display", 0, 1)
+        payload = _mesh_payload()
+        payload["reports"] = [vars(r) for r in reports]
+        payload["engine"] = engine
+        # All fields are already JSON types. Avoid FastAPI recursively copying
+        # millions of coordinates through jsonable_encoder a second time.
+        response = JSONResponse(payload)
+        _report("complete", 1, 1)
+        return response
+    except (RibbingError, FlattenError, BooleanError, StepError, ValueError, TypeError) as e:
         raise HTTPException(400, str(e))
+    finally:
+        PROGRESS["active"] = False
 
-    payload = _mesh_payload()
-    payload["reports"] = [vars(r) for r in reports]
-    payload["engine"] = engine
-    return payload
+
+@app.get("/api/apply_progress")
+def api_apply_progress():
+    """Progress of the apply in flight (the UI polls this at 2 Hz)."""
+    out = dict(PROGRESS)
+    out["elapsed"] = (round(time.time() - out["t0"], 1) if out["active"]
+                      else 0.0)
+    return out
 
 
 @app.post("/api/undo")
+@_model_operation
 def api_undo():
     if len(STATE["stack"]) < 2:
         raise HTTPException(400, "nothing to undo")
     STATE["stack"].pop()
-    return _mesh_payload()
+    return JSONResponse(_mesh_payload())
 
 
 def _export_name(ext):
@@ -241,18 +385,20 @@ def _stl_bytes(v, t):
     buf = io.BytesIO()
     buf.write(b"\0" * 80)
     buf.write(struct.pack("<I", len(t)))
-    e1 = v[t[:, 1]] - v[t[:, 0]]
-    e2 = v[t[:, 2]] - v[t[:, 0]]
-    n = np.cross(e1, e2)
-    ln = np.linalg.norm(n, axis=1, keepdims=True)
-    ln[ln < 1e-12] = 1.0
-    n = n / ln
-    for k, (a, b, c) in enumerate(t):
-        buf.write(struct.pack("<3f", *n[k]))
-        buf.write(struct.pack("<3f", *v[a]))
-        buf.write(struct.pack("<3f", *v[b]))
-        buf.write(struct.pack("<3f", *v[c]))
-        buf.write(b"\0\0")
+    # Binary STL has tightly packed 50-byte little-endian records. Chunking
+    # bounds working memory without a Python loop/struct.pack per triangle.
+    record_type = np.dtype([("normal", "<f4", (3,)),
+                            ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
+    for start in range(0, len(t), 65536):
+        vertices = v[t[start:start + 65536]]
+        normals = np.cross(vertices[:, 1] - vertices[:, 0],
+                           vertices[:, 2] - vertices[:, 0])
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        lengths[lengths < 1e-12] = 1.0
+        records = np.zeros(len(vertices), dtype=record_type)
+        records["normal"] = normals / lengths
+        records["vertices"] = vertices
+        buf.write(records.tobytes())
     return buf.getvalue()
 
 
@@ -272,18 +418,21 @@ def _union_shells():
             for rec in entry["recipes"]:
                 # same frame cache as the interactive applies, so projected
                 # exports rebuild on the identical lattice
-                build = (build_rib_implicit
-                         if rec.get("engine") == "implicit"
-                         else build_rib_meshes)
+                build = {"graph": build_rib_graph,
+                         "implicit": build_rib_implicit}.get(
+                             rec.get("engine"), build_rib_meshes)
                 s, _ = build(entry["shape"], rec["face_ids"],
                              RibParams.from_dict(rec["params"]),
                              quality=3.0,
                              frame_cache=STATE["frame_cache"])
                 fine += s
             solids = fine
-        except Exception:
-            pass  # fall back to the interactive-quality overlay meshes
-    shells = mesh_union(entry["shape"], solids, lin_defl=0.2)
+        except Exception as e:
+            raise HTTPException(400, f"high-quality rib rebuild failed: {e}") from e
+    try:
+        shells = mesh_union(entry["shape"], solids, lin_defl=0.2)
+    except BooleanError as e:
+        raise HTTPException(400, str(e)) from e
     entry["fine_shells"] = shells
     return shells
 
@@ -298,6 +447,7 @@ def _concat_shells(shells):
 
 
 @app.get("/api/export/step")
+@_model_operation
 def api_export_step():
     if not STATE["stack"]:
         raise HTTPException(400, "no model loaded")
@@ -314,6 +464,7 @@ def api_export_step():
 
 
 @app.get("/api/export/stl")
+@_model_operation
 def api_export_stl():
     if not STATE["stack"]:
         raise HTTPException(400, "no model loaded")
@@ -321,16 +472,31 @@ def api_export_stl():
     if entry["overlay"]:
         v, t = _concat_shells(_union_shells())
     else:
-        meshes = STATE["meshes"] or mesh_shape(entry["shape"], 0.2, 0.3)
-        vs, ts, off = [], [], 0
-        for m in meshes:
-            vs.append(m.vertices)
-            ts.append(m.triangles.astype(np.int64) + off)
-            off += len(m.vertices)
-        v, t = np.vstack(vs), np.vstack(ts)
+        # Display meshes may omit faces and are intentionally coarser. Build
+        # and validate the CAD body at export resolution even without ribs.
+        if "body_stl_mesh" not in entry:
+            try:
+                entry["body_stl_mesh"] = _man_to_arrays(
+                    _to_manifold(entry["shape"], 0.2), None)
+            except BooleanError as e:
+                raise HTTPException(400, str(e)) from e
+        v, t = entry["body_stl_mesh"]
+    try:
+        v, t = stl_export_mesh(v, t)
+    except BooleanError as e:
+        raise HTTPException(400, str(e)) from e
     return Response(_stl_bytes(v, t), media_type="model/stl",
                     headers={"Content-Disposition":
                              f'attachment; filename="{_export_name("stl")}"'})
+
+
+@app.get("/api/dev/last_recipe")
+def api_dev_last_recipe():
+    """Face ids + params of recent applies (dev/verification aid: lets a
+    headless repro replay exactly what the UI did)."""
+    if not STATE["stack"]:
+        return {"recipes": []}
+    return {"recipes": _entry()["recipes"][-3:]}
 
 
 @app.post("/api/dev/snapshot")

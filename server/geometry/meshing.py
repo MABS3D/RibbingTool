@@ -5,7 +5,6 @@ import numpy as np
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepGProp import BRepGProp
-from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.GProp import GProp_GProps
 from OCP.GeomAbs import (
     GeomAbs_BSplineSurface,
@@ -21,6 +20,7 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
 
 from .step_io import face_map
+from .cad_tessellation import tessellate_shape
 
 _KIND = {
     GeomAbs_Plane: "plane",
@@ -74,7 +74,7 @@ def face_mesh(face, face_id):
 
 
 def mesh_shape(shape, lin_defl=0.5, ang_defl=0.5):
-    BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
+    tessellate_shape(shape, lin_defl, ang_defl)
     fm = face_map(shape)
     out = []
     for fid in range(1, fm.Size() + 1):
@@ -150,7 +150,7 @@ def region_meshes(shape, face_ids, lin_defl=0.4, ang_defl=0.3):
     Welding follows OCCT's shared-edge node polygons (exact, seam-safe).
     """
     from .step_io import StepError
-    BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
+    tessellate_shape(shape, lin_defl, ang_defl)
     fm = face_map(shape)
     metas, selected_faces = [], {}
     off = 0

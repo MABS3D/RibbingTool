@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 from scipy.spatial import Voronoi
@@ -24,9 +24,12 @@ class RibParams:
     taper_len: float = 5.0   # run-out length at open boundaries (0 = off)
     fillet_root: float = 0.0  # radius blending rib walls into the body
     fillet_top: float = 0.0   # radius rounding the rib top edges
-    mapping: str = "unfold"   # unfold (surface metric) | project (front view)
+    fillet_junction: float = 1.0  # blend between intersecting ribs (graph engine)
+    guide_smoothing: float = 3.0  # surface distance for smoothing extrusion normals
+    mapping: str = "unfold"   # surface (graph metric) | project | unfold (legacy)
     offset_x: float = 0.0    # lattice phase shift in the pattern plane (mm)
     offset_y: float = 0.0
+    mapping_controls: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d):
