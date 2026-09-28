@@ -1,6 +1,6 @@
 import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
-import { mergeVertices, toCreasedNormals } from './vendor/BufferGeometryUtils.js';
+import { MeshBVH, acceleratedRaycast } from './vendor/three-mesh-bvh.js';
 
 const BASE = new THREE.Color(0x8a8f98);
 const HOVER = new THREE.Color(0xaab2c0);
@@ -20,11 +20,13 @@ let anchorDirty = true, lastAnchor = null, hoveredControl = null, hoveredRing = 
 const controlVisibilityCache = new Map();
 const selected = new Set();
 const RIB = new THREE.Color(0xb9a184);
+let renderDirty = true, orbiting = false, displayJob = null, displayRevision = 0;
+let displayStats = null;
 
 export function initViewer(container) {
   viewerContainer = container;
   renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   container.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
@@ -35,7 +37,9 @@ export function initViewer(container) {
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  controls.addEventListener('change', () => { pickDirty = true; anchorDirty = true; });
+  controls.addEventListener('change', () => { pickDirty = true; anchorDirty = true; renderDirty = true; });
+  controls.addEventListener('start', () => { orbiting = true; });
+  controls.addEventListener('end', () => { orbiting = false; pickDirty = true; });
 
   scene.add(new THREE.HemisphereLight(0xf4f6ff, 0x33363d, 1.0));
   // key light rides the camera: thin rib walls face every which way, and a
@@ -58,6 +62,7 @@ export function initViewer(container) {
   scene.add(mappingGroup, markerGroup, rotationGroup);
 
   raycaster = new THREE.Raycaster();
+  raycaster.firstHitOnly = true;
   pointer = new THREE.Vector2(-2, -2);
 
   const el = renderer.domElement;
@@ -164,6 +169,7 @@ export function initViewer(container) {
     camera.updateProjectionMatrix();
     pickDirty = true;
     anchorDirty = true;
+    renderDirty = true;
   };
   new ResizeObserver(resize).observe(container);
   resize();
@@ -171,7 +177,7 @@ export function initViewer(container) {
   renderer.setAnimationLoop(() => {
     if (!rotationDrag) controls.update();
     if (anchorDirty) updateControlScreenState();
-    if (pickDirty) {
+    if (pickDirty && !orbiting) {
       const hit = pickIntersection()?.object ?? null;
       const controlHit = pickMappingControl();
       const ringHit = !!hitRotationRing(pointerPixel());
@@ -180,7 +186,10 @@ export function initViewer(container) {
         hovered = hit; hoveredControl = controlHit; hoveredRing = ringHit; refreshColors();
       }
     }
-    renderer.render(scene, camera);
+    if (renderDirty) {
+      renderer.render(scene, camera);
+      renderDirty = false;
+    }
   });
 }
 
@@ -211,6 +220,7 @@ function surfaceNormal(hit) {
 }
 
 function refreshColors() {
+  renderDirty = true;
   const inspectingMapping = mappingGroup.children.length > 0;
   for (const mesh of group.children) {
     const id = mesh.userData.faceId;
@@ -245,7 +255,10 @@ function disposeGroup(target) {
   target.clear();
 }
 
-export function loadModel(data, { preserveCamera = false } = {}) {
+export async function loadModel(data, { preserveCamera = false } = {}) {
+  const revision = ++displayRevision;
+  if (displayJob) { displayJob.worker.terminate(); displayJob.resolve(null); displayJob = null; }
+  displayStats = null;
   if (rotationDrag) finishRotation('cancel');
   for (const g of [group, overlayGroup, mappingGroup, markerGroup, rotationGroup]) disposeGroup(g);
   controlItems = [];
@@ -261,29 +274,6 @@ export function loadModel(data, { preserveCamera = false } = {}) {
   pickDirty = true;
   modelSize = Math.max(data.bbox[3] - data.bbox[0], data.bbox[4] - data.bbox[1],
     data.bbox[5] - data.bbox[2], 1);
-
-  if (data.overlay) {
-    let geo = new THREE.BufferGeometry();
-    geo.setAttribute('position',
-      new THREE.Float32BufferAttribute(new Float32Array(data.overlay.positions), 3));
-    geo.setIndex(new THREE.Uint32BufferAttribute(new Uint32Array(data.overlay.indices), 1));
-    try {
-      // weld duplicated facet vertices, then smooth-shade across gentle
-      // facets while keeping true edges (rib walls vs tops) crisp
-      const welded = mergeVertices(geo, 1e-4);
-      if (welded !== geo) geo.dispose();
-      geo = welded;
-      const creased = toCreasedNormals(geo, THREE.MathUtils.degToRad(38));
-      if (creased !== geo) geo.dispose();
-      geo = creased;
-    } catch (e) {
-      geo.computeVertexNormals();
-    }
-    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-      color: RIB, metalness: 0.1, roughness: 0.62, side: THREE.DoubleSide,
-    }));
-    overlayGroup.add(mesh);   // not pickable: raycast only targets `group`
-  }
 
   for (const f of data.faces) {
     const geo = new THREE.BufferGeometry();
@@ -301,7 +291,40 @@ export function loadModel(data, { preserveCamera = false } = {}) {
   if (!preserveCamera) fitCamera(data.bbox);
   refreshColors();
   if (pickCb) pickCb(getSelection(), null);
+  if (data.overlay) {
+    const positions = new Float32Array(data.overlay.positions);
+    const indices = new Uint32Array(data.overlay.indices);
+    const result = await new Promise((resolve, reject) => {
+      const worker = new Worker(new URL('./rib-display-worker.js', import.meta.url), { type: 'module' });
+      displayJob = { worker, resolve };
+      const finish = () => { worker.terminate(); if (displayJob?.worker === worker) displayJob = null; };
+      worker.onmessage = ({ data: message }) => {
+        finish();
+        if (message.error) reject(new Error('Rib preview failed: ' + message.error));
+        else resolve(message.result);
+      };
+      worker.onerror = () => { finish(); reject(new Error('Rib preview worker failed; reload the page to retry')); };
+      worker.postMessage({ positions, indices }, [positions.buffer, indices.buffer]);
+    });
+    if (revision !== displayRevision || !result) return false;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(result.normals, 3));
+    geo.setIndex(new THREE.BufferAttribute(result.indices, 1));
+    geo.boundsTree = MeshBVH.deserialize(result.bvh, geo, { setIndex: false });
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color: RIB, metalness: 0.1, roughness: 0.62, side: THREE.DoubleSide,
+    }));
+    mesh.raycast = acceleratedRaycast;
+    overlayGroup.add(mesh);
+    displayStats = result.stats;
+    controlVisibilityCache.clear();
+    anchorDirty = pickDirty = renderDirty = true;
+  }
+  return true;
 }
+
+export function getDisplayStats() { return displayStats ? { ...displayStats } : null; }
 
 export function clearModel() {
   loadModel({ faces: [], overlay: null, bbox: [-50, -50, -50, 50, 50, 50] });
@@ -462,6 +485,7 @@ function pointVisible(point, tolerance = modelSize * 1e-5) {
   const distance = direction.length();
   if (distance < camera.near) return false;
   const sight = new THREE.Raycaster(camera.position, direction.normalize(), 0, Math.max(0, distance - tolerance));
+  sight.firstHitOnly = true;
   // Both the CAD body and generated ribs occlude control anchors.
   return sight.intersectObjects([...group.children, ...overlayGroup.children], false).length === 0;
 }
@@ -583,6 +607,7 @@ function buildRotationGizmo(item) {
 }
 
 function updateControlScreenState() {
+  renderDirty = true;
   anchorDirty = false;
   camera.updateMatrixWorld(true);
   scene.updateMatrixWorld(true);

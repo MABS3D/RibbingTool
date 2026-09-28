@@ -1,0 +1,68 @@
+{
+  "stats": {
+    "render": {
+      "frame": 187,
+      "calls": 983,
+      "triangles": 1933197,
+      "points": 0,
+      "lines": 348
+    },
+    "memory": {
+      "geometries": 976,
+      "textures": 8
+    },
+    "overlay": [
+      {
+        "vertices": 1731271,
+        "triangles": 1900160
+      }
+    ],
+    "gl": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1070 Ti (0x00001B82) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+  },
+  "loadTime": {
+    "fetch": 697.7999999821186,
+    "load": 12564.90000000596
+  },
+  "orbit": {
+    "frames": {
+      "n": 185,
+      "median": 6.900000000001455,
+      "p95": 7,
+      "max": 7.100000000002183
+    },
+    "renders": {
+      "n": 182,
+      "median": 1.699999988079071,
+      "p95": 2.199999988079071,
+      "max": 6.300000011920929
+    },
+    "rays": {
+      "n": 666687,
+      "median": 0,
+      "p95": 0,
+      "max": 0.19999998807907104
+    },
+    "calls": 182
+  },
+  "idle": {
+    "frames": {
+      "n": 430,
+      "median": 6.900000000001455,
+      "p95": 7,
+      "max": 34.600000000000364
+    },
+    "renders": {
+      "n": 1,
+      "median": 28,
+      "p95": 28,
+      "max": 28
+    },
+    "rays": {
+      "n": 967,
+      "median": 0,
+      "p95": 0,
+      "max": 0.10000002384185791
+    },
+    "calls": 1
+  }
+}

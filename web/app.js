@@ -111,10 +111,17 @@ onPick((sel, last) => {
   mappingEditor?.selectionChanged();
 });
 
-function applyModel(data, { preserve = false, selection = null } = {}) {
-  modelRevision += 1;
+async function applyModel(data, { preserve = false, selection = null } = {}) {
+  const revision = ++modelRevision;
   updatingModel = true;
-  loadModel(data, { preserveCamera: preserve });
+  let loaded;
+  try {
+    loaded = await loadModel(data, { preserveCamera: preserve });
+  } finally {
+    if (revision === modelRevision) updatingModel = false;
+  }
+  if (!loaded || revision !== modelRevision) return;
+  updatingModel = true;
   modelLoaded = true;
   modelToken = data.model_token;
   canUndo = !!data.can_undo;
@@ -141,7 +148,7 @@ $('file-input').addEventListener('change', async (e) => {
     fd.append('file', file);
     const r = await fetch('/api/load', { method: 'POST', body: fd });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    applyModel(await r.json());
+    await applyModel(await r.json());
     note('ok', 'model loaded - click faces to select, then Apply ribs');
   } catch (err) {
     note('err', 'load failed: ' + err.message);
@@ -246,7 +253,8 @@ $('btn-apply').addEventListener('click', async () => {
     });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const data = await r.json();
-    applyModel(data, { preserve: data.engine === 'graph',
+    setBusy(true, 'preparing 3D view...');
+    await applyModel(data, { preserve: data.engine === 'graph',
                        selection: data.engine === 'graph' ? face_ids : null });
     const lines = [`engine: ${data.engine}`];
     for (const rep of data.reports) {
@@ -275,7 +283,7 @@ $('btn-undo').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/undo', { method: 'POST' });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    applyModel(await r.json(), { preserve: true, selection: getSelection() });
+    await applyModel(await r.json(), { preserve: true, selection: getSelection() });
     note('ok', 'reverted');
   } catch (err) {
     note('err', 'undo failed: ' + err.message);
@@ -295,7 +303,7 @@ window.__loadPath = async (path) => {
       body: JSON.stringify({ path }),
     });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    applyModel(await r.json());
+    await applyModel(await r.json());
     note('ok', 'model loaded - click faces to select, then Apply ribs');
     return true;
   } catch (err) {
@@ -384,5 +392,9 @@ const resumeRevision = modelRevision;
 fetch('/api/model').then(async response => {
   if (!response.ok) return;
   const data = await response.json();
-  if (resumeRevision === modelRevision && !modelLoaded && !operationBusy) applyModel(data);
-}).catch(() => { /* Server may still be starting. File upload remains available. */ });
+  if (resumeRevision === modelRevision && !modelLoaded && !operationBusy) {
+    setBusy(true, 'preparing 3D view...');
+    try { await applyModel(data); }
+    finally { setBusy(false); refreshButtons(); }
+  }
+}).catch(error => { note('err', 'Could not restore the 3D view: ' + error.message); });

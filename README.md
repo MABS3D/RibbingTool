@@ -36,8 +36,9 @@ preview the mapping and click **Apply ribs**.
 
 ## Status
 
-Work in progress. Dense models can take significant time and memory; viewer
-performance after Apply is being improved. Mapping controls are manually
+Work in progress. Dense models can take significant time and memory. The viewer
+prepares a lighter display mesh in a background worker; exports retain the
+original geometry. Mapping controls are manually
 prescribed design fields, not FEA or stress optimization. Surface-graph exports
 are faceted geometry; mapping across difficult folds and seams still needs work.
 
@@ -51,3 +52,5 @@ are faceted geometry; mapping across difficult folds and seams still needs work.
 See [usage and geometry engines](docs/usage.md),
 [mapping controls](docs/mapping-controls.md), and
 [generation tests and benchmarks](docs/generation-performance.md).
+See [viewer performance and browser tests](docs/viewer-performance.md) for the
+post-Apply rendering changes and their measured limits.
