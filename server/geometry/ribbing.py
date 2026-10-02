@@ -809,24 +809,58 @@ def _projection_frame(regions):
     """Shared projected-mapping frame: (center, (3,2) in-plane axes).
 
     ONE best-fit plane for ALL regions puts disjoint panels in a single 2D
-    space so they can share lattice phase. Axis signs are deterministic, and
-    (u, v, n) is right-handed with the outward normal so front-facing
-    triangles keep their CCW winding in projection.
+    space so they can share lattice phase. Integrating the first and second
+    moments over the triangles prevents dense CAD fillets or local mesh
+    refinement from moving/rotating the lattice on an unchanged surface.
+    On a wrapped surface, the least-variance axis can see every face edge-on.
+    A well-defined mean outward normal provides a useful view in that case.
+    Axis signs are deterministic, and (u, v, n) is right-handed with the
+    outward normal so front-facing triangles keep their CCW winding.
     """
-    allv = np.vstack([r.vertices for r in regions])
-    ctr = allv.mean(axis=0)
-    x = allv - ctr
-    _, vecs = np.linalg.eigh(x.T @ x)      # ascending variance
-    n = vecs[:, 0]                         # least variance = view normal
+    # Work relative to a nearby point: raw second moments lose precision
+    # for small parts whose CAD placement is far from the world origin.
+    origin = regions[0].vertices[0]
+    mass, first = 0., np.zeros(3)
     outward = np.zeros(3)
     for r in regions:
-        v = r.vertices
-        outward += np.cross(v[r.triangles[:, 1]] - v[r.triangles[:, 0]],
-                            v[r.triangles[:, 2]] - v[r.triangles[:, 0]]
-                            ).sum(axis=0)
+        q = r.vertices[r.triangles]-origin
+        cross = np.cross(q[:, 1]-q[:, 0], q[:, 2]-q[:, 0])
+        area = np.linalg.norm(cross, axis=1)/2
+        mass += area.sum()
+        first += np.einsum('i,ij->j', area, q.mean(axis=1))
+        outward += cross.sum(axis=0)
+    if not np.isfinite(mass) or mass <= 0:
+        raise RibbingError("selected surface has no usable area for its mapping frame")
+    offset = first/mass
+    ctr = origin+offset
+    covariance = np.zeros((3, 3))
+    for r in regions:
+        q = (r.vertices[r.triangles]-origin)-offset
+        area = np.linalg.norm(np.cross(q[:, 1]-q[:, 0], q[:, 2]-q[:, 0]), axis=1)/2
+        total = q.sum(axis=1)
+        # Integral of x*x^T over one triangle, apart from a common 1/12.
+        covariance += (np.einsum('i,ijk,ijl->kl', area, q, q)
+                       + np.einsum('i,ik,il->kl', area, total, total))
+    _, vecs = np.linalg.eigh(covariance)   # ascending surface variance
+    n = vecs[:, 0]                         # least variance = view normal
+    u = vecs[:, 1]
+    outward_length = np.linalg.norm(outward)
+    if (outward_length > 2*mass*1e-6
+            and abs(n @ outward) < .05*outward_length):
+        # A wide cylindrical wrap can have its smallest spatial variance
+        # along the cylinder axis. That view collapses the selected walls
+        # to a silhouette, despite their consistent mean facing direction.
+        # Restrict the correction to practically edge-on views (within three
+        # degrees); oblique selections still have a usable projection.
+        # Closed selections have cancelling normals and must not use the
+        # numerical remainder as an orientation guide.
+        n = outward/outward_length
+        tangent = np.eye(3)-np.outer(n, n)
+        _, directions = np.linalg.eigh(tangent@covariance@tangent)
+        u = tangent@directions[:, 1]  # first eigenvector is the null normal
+        u /= np.linalg.norm(u)
     if n @ outward < 0:
         n = -n
-    u = vecs[:, 1]
     if u[int(np.argmax(np.abs(u)))] < 0:
         u = -u
     return ctr, np.stack([u, np.cross(n, u)], axis=1)

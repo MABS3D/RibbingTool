@@ -54,3 +54,5 @@ See [usage and geometry engines](docs/usage.md),
 [generation tests and benchmarks](docs/generation-performance.md).
 See [viewer performance and browser tests](docs/viewer-performance.md) for the
 post-Apply rendering changes and their measured limits.
+See [rib finishing](docs/rib-finishing.md) for junctions, tapered roots and
+tessellation-independent pattern placement, including recipe compatibility.

@@ -53,6 +53,9 @@ Controls:
   Zero uses the original surface normals. The default is 3 mm.
 - **Root fillet**, **top fillet**, and **junction fillet** are independent.
   Top radius is limited to half the wall thickness and the rib height.
+  The network is blended before the top fillet is applied. Nearby guide
+  crowns transition smoothly at curved intersections without lifting a flat
+  crown. Root radius decreases smoothly as a run-out approaches zero height.
 - **Margin** and **taper** use distance to the selected surface's actual open
   boundary. Centerline clearance includes half the wall thickness; root blends
   can broaden the footprint beyond it. Internal endpoints of hexagonal or
@@ -74,3 +77,9 @@ fold, cylinders extending beyond the silhouette, positive map orientation,
 dimension controls, excluded adjacent faces, and solid union; real dashboard
 references are also checked. Boundary ribs are inset in pattern coordinates;
 on curved surfaces their offset inherits the map's residual metric distortion.
+
+The selection frame uses integrated surface-area moments, so merely refining
+the CAD tessellation does not move or rotate the pattern. This replaces the
+older vertex-density-dependent frame: regenerating older recipes can change
+their lattice phase and orientation. Review the mapping preview after updating.
+See [finishing validation](rib-finishing.md) for the geometric checks and limits.

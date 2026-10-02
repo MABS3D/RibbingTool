@@ -1,0 +1,487 @@
+{
+  "date": "2026-10-02",
+  "references": {
+    "part1": {
+      "face_ids": [
+        97
+      ],
+      "params": {
+        "pattern": "isogrid",
+        "spacing": 12.0,
+        "spacing_y": null,
+        "thickness": 1.6,
+        "height": 4.0,
+        "orientation_deg": 0.0,
+        "draft_deg": 0.0,
+        "margin": 2.0,
+        "embed": 0.3,
+        "border": false,
+        "density": 0.008,
+        "seed": 1,
+        "base_angle_deg": 0.0,
+        "taper_len": 5.0,
+        "fillet_root": 1.2,
+        "fillet_top": 0.5,
+        "fillet_junction": 1.2,
+        "guide_smoothing": 3.0,
+        "mapping": "surface",
+        "offset_x": 0.0,
+        "offset_y": 0.0,
+        "mapping_controls": []
+      },
+      "measurements": {
+        "preview_cold": {
+          "paths": 9,
+          "points": 393,
+          "controls": 0,
+          "triangles": 45,
+          "mapping_seconds": 2.72,
+          "warnings": [],
+          "paths_sha256": "f969913b4a703e0f85f2b2ebcc50bfffc8017026a0a8405b5456d8d4fde73d5b",
+          "cache": {
+            "keys": [
+              "_graph_prepared",
+              "_graph_sources",
+              "surface_maps"
+            ],
+            "array_count": 42,
+            "array_megabytes": 0.0279
+          }
+        },
+        "preview_warm": {
+          "paths": 9,
+          "points": 393,
+          "controls": 0,
+          "triangles": 45,
+          "mapping_seconds": 0.0,
+          "warnings": [],
+          "paths_sha256": "f969913b4a703e0f85f2b2ebcc50bfffc8017026a0a8405b5456d8d4fde73d5b",
+          "cache": {
+            "keys": [
+              "_graph_prepared",
+              "_graph_sources",
+              "surface_maps"
+            ],
+            "array_count": 42,
+            "array_megabytes": 0.0279
+          }
+        },
+        "preview_cold_warm_identical": true,
+        "apply": {
+          "vertices": 22130,
+          "triangles": 44264,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 652.2956946879308,
+          "positive_components": 1,
+          "negative_components": 0,
+          "bbox": [
+            -59.006231297096825,
+            -52.71319325228666,
+            97.1837238216726,
+            -21.02134821689362,
+            -43.16905363758202,
+            112.4757639751262
+          ],
+          "array_sha256": "38d258f431b51dc552a365537a449fbef5fcafe5b6cddaba55ff03e2e34145af",
+          "closed_valid_mesh": true,
+          "reports": [
+            {
+              "face_id": 97,
+              "face_ids": [
+                97
+              ],
+              "segments": 15,
+              "lofted": 9,
+              "skipped": 0,
+              "warnings": [
+                "surface graph: 9 paths, 0.25mm voxels, 10.0s"
+              ]
+            }
+          ]
+        },
+        "cache_after_apply": {
+          "keys": [
+            "_graph_body_sources",
+            "_graph_prepared",
+            "_graph_sources",
+            "surface_maps"
+          ],
+          "array_count": 4,
+          "array_megabytes": 14.0875
+        },
+        "fine": {
+          "vertices": 200074,
+          "triangles": 400152,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 658.0740343307406,
+          "positive_components": 1,
+          "negative_components": 0,
+          "bbox": [
+            -59.02605704902486,
+            -52.71296481340464,
+            97.16519946222898,
+            -21.006677873465218,
+            -43.06647461443248,
+            112.48388088914827
+          ],
+          "array_sha256": "8b4d93ffd3c3ebfa8a442358f3324ff42e756e5ca0ae9f53518e5c2060074a1a",
+          "closed_valid_mesh": true,
+          "reports": [
+            {
+              "face_id": 97,
+              "face_ids": [
+                97
+              ],
+              "segments": 15,
+              "lofted": 9,
+              "skipped": 0,
+              "warnings": [
+                "surface graph: 9 paths, 0.08mm voxels, 53.3s"
+              ]
+            }
+          ]
+        },
+        "union": {
+          "vertices": 22054,
+          "triangles": 44148,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 507366.15369501186,
+          "positive_components": 1,
+          "negative_components": 0,
+          "bbox": [
+            -207.243017570756,
+            -134.14952448363726,
+            -4.20275665397735e-08,
+            102.20171227895618,
+            34.208481023482875,
+            258.17438885527
+          ],
+          "array_sha256": "7c657c2c9f5e7e219fe0bb4077518de07e86ddfaa538fd0618cb35e4dffe8f87",
+          "closed_valid_mesh": true,
+          "body_mesh_volume_mm3": 506996.31070011586,
+          "added_volume_mm3": 369.8429948959965,
+          "all_ribs_attached": true
+        },
+        "stl": {
+          "bytes": 2207484,
+          "triangles": 44148,
+          "record_count_correct": true,
+          "finite": true,
+          "collapsed_triangles_after_float32": 0,
+          "signed_volume_mm3": 507366.04999167455,
+          "sha256": "b5b6a5e8c3a8f57bbd2afdf7d3cb4063b08120b894c9713947812e1053617405"
+        }
+      },
+      "timings_seconds": {
+        "load_model": 1.596158,
+        "initial_body_mesh": 0.88071,
+        "preview_cold": 2.719616,
+        "preview_warm": 0.000311,
+        "apply_quality1": 10.034747,
+        "validate_apply": 0.111226,
+        "fine_build": 53.427726,
+        "validate_fine": 1.285429,
+        "union_body_fine": 3.435267,
+        "validate_union": 0.122641,
+        "reference_export_body": 2.750704,
+        "prepare_stl_precision": 0.257174,
+        "serialize_stl": 0.018036,
+        "validate_stl": 0.00566
+      },
+      "quality_pass": true
+    },
+    "part2": {
+      "face_ids": [
+        208
+      ],
+      "params": {
+        "pattern": "isogrid",
+        "spacing": 12.0,
+        "spacing_y": null,
+        "thickness": 1.6,
+        "height": 4.0,
+        "orientation_deg": 0.0,
+        "draft_deg": 0.0,
+        "margin": 2.0,
+        "embed": 0.3,
+        "border": false,
+        "density": 0.008,
+        "seed": 1,
+        "base_angle_deg": 0.0,
+        "taper_len": 5.0,
+        "fillet_root": 1.2,
+        "fillet_top": 0.5,
+        "fillet_junction": 1.2,
+        "guide_smoothing": 3.0,
+        "mapping": "surface",
+        "offset_x": 0.0,
+        "offset_y": 0.0,
+        "mapping_controls": []
+      },
+      "measurements": {
+        "preview_cold": {
+          "paths": 9,
+          "points": 331,
+          "controls": 0,
+          "triangles": 1409,
+          "mapping_seconds": 2.652,
+          "warnings": [],
+          "paths_sha256": "2da935ec9652847f885c7490223f3be4affdb6974b3929beb165a515b717e64f",
+          "cache": {
+            "keys": [
+              "_graph_prepared",
+              "_graph_sources",
+              "surface_maps"
+            ],
+            "array_count": 42,
+            "array_megabytes": 0.0991
+          }
+        },
+        "preview_warm": {
+          "paths": 9,
+          "points": 331,
+          "controls": 0,
+          "triangles": 1409,
+          "mapping_seconds": 0.0,
+          "warnings": [],
+          "paths_sha256": "2da935ec9652847f885c7490223f3be4affdb6974b3929beb165a515b717e64f",
+          "cache": {
+            "keys": [
+              "_graph_prepared",
+              "_graph_sources",
+              "surface_maps"
+            ],
+            "array_count": 42,
+            "array_megabytes": 0.0991
+          }
+        },
+        "preview_cold_warm_identical": true,
+        "apply": {
+          "vertices": 19502,
+          "triangles": 38992,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 522.6137354135221,
+          "positive_components": 4,
+          "negative_components": 0,
+          "bbox": [
+            10.540882073708266,
+            -56.07777574298198,
+            -175.6619811607682,
+            38.75712025547997,
+            -27.949747118217058,
+            -160.44134101077424
+          ],
+          "array_sha256": "c4f5ce8f451a68abb927dd2bf2089cc6dbfea955bff2826213f9f98e01db97c0",
+          "closed_valid_mesh": true,
+          "reports": [
+            {
+              "face_id": 208,
+              "face_ids": [
+                208
+              ],
+              "segments": 21,
+              "lofted": 9,
+              "skipped": 0,
+              "warnings": [
+                "surface graph: 9 paths, 0.25mm voxels, 10.2s"
+              ]
+            }
+          ]
+        },
+        "cache_after_apply": {
+          "keys": [
+            "_graph_body_sources",
+            "_graph_prepared",
+            "_graph_sources",
+            "surface_maps"
+          ],
+          "array_count": 45,
+          "array_megabytes": 12.9013
+        },
+        "fine": {
+          "vertices": 177650,
+          "triangles": 355288,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 526.4458692835038,
+          "positive_components": 4,
+          "negative_components": 0,
+          "bbox": [
+            10.450877307364804,
+            -56.16035372661001,
+            -175.7038363464566,
+            38.77892222826591,
+            -27.934934340994776,
+            -160.45215728341984
+          ],
+          "array_sha256": "387b7f80e38a17b93ca9bad81326b5e9e6dedfb8b296da6eda7b2fff55457510",
+          "closed_valid_mesh": true,
+          "reports": [
+            {
+              "face_id": 208,
+              "face_ids": [
+                208
+              ],
+              "segments": 21,
+              "lofted": 9,
+              "skipped": 0,
+              "warnings": [
+                "surface graph: 9 paths, 0.08mm voxels, 53.5s"
+              ]
+            }
+          ]
+        },
+        "union": {
+          "vertices": 22704,
+          "triangles": 45448,
+          "input_shells": 1,
+          "finite": true,
+          "valid_indices": true,
+          "collapsed_triangles": 0,
+          "boundary_edges": 0,
+          "nonmanifold_edges": 0,
+          "manifold_status": "Error.NoError",
+          "volume_mm3": 494387.2468658413,
+          "positive_components": 1,
+          "negative_components": 0,
+          "bbox": [
+            -207.243017570756,
+            -134.14952448361933,
+            -258.17438885527,
+            102.20171227895618,
+            34.1973878832338,
+            3.0
+          ],
+          "array_sha256": "223634747d401dd059e846d3cd41ca65701f6bfdd4a241f85f21953bbe13319f",
+          "closed_valid_mesh": true,
+          "body_mesh_volume_mm3": 494076.8649923757,
+          "added_volume_mm3": 310.3818734656088,
+          "all_ribs_attached": true
+        },
+        "stl": {
+          "bytes": 2272484,
+          "triangles": 45448,
+          "record_count_correct": true,
+          "finite": true,
+          "collapsed_triangles_after_float32": 0,
+          "signed_volume_mm3": 494387.17871248914,
+          "sha256": "52535331a781a03944df6e9ab6028525657a5887fe4bdeceff98716f4ca35235"
+        }
+      },
+      "timings_seconds": {
+        "load_model": 1.596499,
+        "initial_body_mesh": 0.803513,
+        "preview_cold": 2.651846,
+        "preview_warm": 0.000252,
+        "apply_quality1": 10.172786,
+        "validate_apply": 0.118486,
+        "fine_build": 53.476677,
+        "validate_fine": 1.448423,
+        "union_body_fine": 3.084187,
+        "validate_union": 0.123322,
+        "reference_export_body": 2.463284,
+        "prepare_stl_precision": 0.263506,
+        "serialize_stl": 0.004236,
+        "validate_stl": 0.006564
+      },
+      "quality_pass": true
+    }
+  },
+  "assembly": {
+    "faces": [
+      17,
+      277,
+      280,
+      295,
+      428
+    ],
+    "scope": "Preview and quality-1 Apply only; no fine rebuild, union, or STL validation.",
+    "checks": {
+      "completed": true,
+      "exact_model": true,
+      "exact_faces": true,
+      "exact_params": true,
+      "closed_valid_apply": true,
+      "deterministic_preview": true
+    },
+    "apply": {
+      "vertices": 3880102,
+      "triangles": 7762744,
+      "input_shells": 1,
+      "finite": true,
+      "valid_indices": true,
+      "collapsed_triangles": 0,
+      "boundary_edges": 0,
+      "nonmanifold_edges": 0,
+      "manifold_status": "Error.NoError",
+      "volume_mm3": 116202.43843980259,
+      "positive_components": 1,
+      "negative_components": 0,
+      "bbox": [
+        -210.745309627955,
+        -122.53616975061408,
+        1.8128656617345769,
+        92.59346338840439,
+        30.150307613337837,
+        262.05758224634343
+      ],
+      "array_sha256": "f0f0fcb7de94c113fd291e41fb0097c9e7f87dab8303c6e14ce4183977e31050",
+      "closed_valid_mesh": true,
+      "reports": [
+        {
+          "face_id": 17,
+          "face_ids": [
+            17,
+            277,
+            280,
+            295,
+            428
+          ],
+          "segments": 143,
+          "lofted": 103,
+          "skipped": 0,
+          "warnings": [
+            "Local controls prescribe design fields, not stresses. Influence follows intrinsic mesh surface distances; existing chart seams remain boundaries.",
+            "surface graph: 103 paths, 0.25mm voxels, 367.8s"
+          ]
+        }
+      ]
+    },
+    "apply_seconds": 368.353973,
+    "peak_private_mib": 6242.71
+  },
+  "notes": [
+    "Reference export checks use bounded regions, not the whole assembly.",
+    "Before/after selection frame changed from vertex moments to surface-area moments.",
+    "Timings were collected with concurrent verification jobs and are not a controlled speed comparison."
+  ]
+}

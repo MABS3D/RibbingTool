@@ -247,7 +247,7 @@ class Ribbon:
         # Planar/parallel guides, including tapered endpoints, have an affine
         # crown distance on each ribbon triangle. Evaluate that directly;
         # interpolating three identical normals for every voxel adds no data.
-        if self.height_values is None and np.max(np.abs(self.normals-self.normals[0])) < 1e-12:
+        if np.max(np.abs(self.normals-self.normals[0])) < 1e-12:
             self.parallel_normal = self.normals[0].copy()
             f, gram = self.mesh.f, self.mesh.inv_gram
             a = self.top_distance[f[:, 0]]
@@ -265,14 +265,21 @@ class Ribbon:
             self.top_correction[flat] = 0
             self.top_constant[flat] = -levels[f[flat, 0]]
 
-    def field(self, q, half, radius, draft, height=None):
+    def distances(self, q, half, draft, height=None):
+        """Wall and crown distances from one closest-point query.
+
+        Keep these separate until the network has been blended. Blending
+        already capped ribs rounds their crowns upward and a subsequent
+        height cut leaves a sharp edge through the requested top fillet.
+        """
         sq, ids, cp = self.mesh.query(q)
+        if self.parallel_normal is None or self.height_values is not None:
+            b = self.mesh.barycentric(cp, ids)
+            tri = self.mesh.f[ids]
         if self.parallel_normal is not None:
             top = (np.einsum('ij,j->i', q, self.parallel_normal)
                    + np.einsum('ij,ij->i', cp, self.top_correction[ids])+self.top_constant[ids])
         else:
-            b = self.mesh.barycentric(cp, ids)
-            tri = self.mesh.f[ids]
             n = _unit(np.einsum('ijk,ij->ik', self.normals[tri], b))
             top = np.einsum('ij,ij->i', q-cp, n)+np.einsum('ij,ij->i', self.top_distance[tri], b)
         # The closest point already accounts for caps at curve endpoints.
@@ -280,13 +287,16 @@ class Ribbon:
         depth = np.maximum(-top, 0)
         if self.height_values is not None:
             height = np.einsum('ij,ij->i', self.height_values[tri], b)
-            radius = np.minimum(radius, height)
         if height is not None:
             depth = np.minimum(depth, height)
         side -= draft*depth
-        a, z = side+radius, top+radius
-        return np.minimum(np.maximum(a, z), 0)+np.hypot(np.maximum(a, 0),
-                                                       np.maximum(z, 0))-radius
+        return side, top, height
+
+    def field(self, q, half, radius, draft, height=None):
+        side, top, height = self.distances(q, half, draft, height)
+        if height is not None:
+            radius = np.minimum(radius, height)
+        return _round_intersection(side, top, radius)
 
 
 def trace_rib_paths(v, f, n, segments, params, step=0.3, groups=None,
@@ -381,9 +391,39 @@ def make_ribbons(v, f, n, segments, params, step=0.3, groups=None, coordinates=N
 
 def _round_union(fields, radius):
     m = fields.min(axis=0)
-    if radius <= 0:
+    if np.all(np.asarray(radius) <= 0):
         return m
     return np.maximum(radius, m)-np.sqrt((np.maximum(radius-fields, 0)**2).sum(axis=0))
+
+
+def _round_intersection(a, b, radius):
+    """Inset circular fillet: preserve the two planes outside the corner."""
+    a, b = a+radius, b+radius
+    return (np.minimum(np.maximum(a, b), 0)
+            + np.hypot(np.maximum(a, 0), np.maximum(b, 0))-radius)
+
+
+def _crown_envelope(sides, tops, reach, smoothing):
+    """Blend nearby crown directions without raising a constant-height crown.
+
+    A hard minimum switches abruptly between the guide planes at a curved
+    junction. The normalized soft minimum is exact for equal heights and a
+    single contributor, and never lies below the lowest contributing field.
+    Compact lateral weights prevent remote high ribs from lifting a run-out.
+    """
+    capped = np.maximum(tops, sides-reach)
+    crown = capped.min(axis=0)
+    if smoothing <= 0 or reach <= 0 or len(tops) == 1:
+        return crown
+    t = np.clip(np.maximum(sides, 0)/reach, 0, 1)
+    weights = (1-t)**4*(4*t+1)
+    total = weights.sum(axis=0)
+    active = total > 0
+    low = np.where(weights[:, active] > 0, tops[:, active], np.inf).min(axis=0)
+    exponent = np.minimum(-(tops[:, active]-low)/smoothing, 0)
+    average = (weights[:, active]*np.exp(exponent)).sum(axis=0)/total[active]
+    crown[active] = low-smoothing*np.log(average)
+    return crown
 
 
 class RibField:
@@ -427,18 +467,38 @@ class RibField:
                 continue
             q = chunk[active]
             body = self.body.signed(q)
-            fields = np.stack([r.field(q, p.thickness/2,
-                                      min(p.fillet_top, p.thickness/2, p.height),
-                                      math.tan(math.radians(p.draft_deg)), p.height)
-                               for r in self.ribbons])
-            wall = _round_union(fields, max(p.fillet_junction, 0))
+            distances = [r.distances(q, p.thickness/2,
+                                     math.tan(math.radians(p.draft_deg)), p.height)
+                         for r in self.ribbons]
+            sides = np.stack([d[0] for d in distances])
+            tops = np.stack([d[1] for d in distances])
+            top_radius = min(p.fillet_top, p.thickness/2, p.height)
+            junction = max(p.fillet_junction, 0)
             k = max(p.fillet_root, 0)
+            # Extend each wall only far enough to construct the local blend.
+            # The crown envelope includes the taper and manual height fields,
+            # but is bounded laterally: a tall, distant rib cannot lift a tip.
+            extension = max(k, junction)+top_radius
+            crowns = _crown_envelope(sides, tops, extension,
+                                      min(p.thickness/20, junction/10))
+            wall = _round_union(np.maximum(sides, tops-extension), junction)
             value = wall
             if k:
-                value = _round_union(np.stack([wall, body+.05]), k)
+                # A root fillet needs room below the local crown. Let its
+                # radius vanish with the run-out instead of trimming a full
+                # sized blend into a thin, broad tab at a zero-height tip.
+                room = np.clip(body-crowns, 0, 2*k)
+                root_radius = room*(1-room/(4*k))
+                value = _round_union(np.stack([wall, body+.05]), root_radius)
                 # Only a local root footprint is needed. A whole-body skin
                 # would obscure the preview and mask disconnected graph defects.
-                value = np.maximum(value, wall-k)
+                value = np.maximum(value, wall-root_radius)
+            if self.height_values is not None:
+                # A locally shortened rib must retain a feasible crown radius.
+                heights = np.stack([np.broadcast_to(d[2], len(q)) for d in distances])
+                owner = np.maximum(tops, sides-extension).argmin(axis=0)
+                top_radius = np.minimum(top_radius, heights[owner, np.arange(len(q))])
+            value = _round_intersection(value, crowns, top_radius)
             # Trim after both blends: even a root radius larger than the
             # rib height must not lift the crown above the height offset.
             query = None
